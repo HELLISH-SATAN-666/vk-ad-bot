@@ -825,6 +825,9 @@ def register_handlers(app: VKBotApp) -> None:
         if ctx.cmd.endswith("apply"):
             async with ManualPayments() as payments:
                 state = await payments.get_payment_state(pay_id)
+                if state is None:
+                    await ctx.answer("Оплата уже обработана или не найдена.", keyboard=kb.admin_menu())
+                    return
                 await payments.delete(pay_id)
             await activate_payment_state(ctx.api, state)
             await ctx.answer("Оплата подтверждена.", keyboard=kb.admin_menu())

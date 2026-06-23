@@ -103,7 +103,15 @@ class VKApi:
             params["keyboard"] = keyboard
         if attachment:
             params["attachment"] = attachment
-        response = await self.call("messages.send", **params)
+        try:
+            response = await self.call("messages.send", **params)
+        except VKApiError as exc:
+            if keyboard and exc.error.get("error_code") == 912:
+                logger.warning("VK rejected keyboard for peer_id=%s; retrying without keyboard", peer_id)
+                params.pop("keyboard", None)
+                response = await self.call("messages.send", **params)
+            else:
+                raise
         return int(response)
 
     async def edit_message(self, peer_id: int, message_id: int, message: str, keyboard: Optional[str] = None) -> None:

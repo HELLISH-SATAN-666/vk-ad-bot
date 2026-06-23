@@ -1,4 +1,5 @@
 from json import dumps, loads
+from typing import Optional
 
 from .base import Database
 
@@ -17,11 +18,13 @@ class ManualPayments(Database):
 
         return pay_id
 
-    async def get_payment_state(self, pay_id: int) -> dict:
+    async def get_payment_state(self, pay_id: int) -> Optional[dict]:
         payment_state = await self.fetchval(
             f"SELECT payment_state FROM manual_payments WHERE id = $1;",
             pay_id
         )
+        if payment_state is None:
+            return None
         return payment_state if isinstance(payment_state, dict) else loads(payment_state)
 
     async def get_all(self):

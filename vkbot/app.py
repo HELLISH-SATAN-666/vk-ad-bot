@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from database.vk_meta import VkProcessedMessages
 from vkbot.api import VKApi, attachment_to_vk_id, parse_payload
 
 
@@ -90,6 +91,46 @@ class Ctx:
 Handler = Callable[[Ctx], Any]
 
 
+TEXT_COMMAND_ALIASES = {
+    "я рекламодатель": "menu_advertiser",
+    "подключение рекламы": "menu_partner",
+    "админ панель": "menu_adminpanel",
+    "админ-панель": "menu_adminpanel",
+    "купить рекламу": "buy_ad",
+    "тарифы": "paid_plains",
+    "объявление": "buy_ad.poster",
+    "доступ по подписке": "buy_ad.group",
+    "рассылка": "buy_ad.newsletter",
+    "добавить площадку": "add_bot_group",
+    "профиль": "partner_profile",
+    "вывод средств": "money_requests",
+    "управление площадками": "manage_partner_groups",
+    "группы партнеров": "manage_partner_groups_admin",
+    "группы партнёров": "manage_partner_groups_admin",
+    "заявки на вывод": "manage_requests",
+    "ручные оплаты": "manual_payments",
+    "параметры": "admin_var_settings",
+    "подписки": "subs_stat_menu",
+    "статистика": "statistics",
+    "назад": "main_menu",
+}
+
+
+def normalize_text_command(text: str) -> str:
+    return " ".join(text.casefold().replace("ё", "е").split())
+
+
+async def is_new_message(api: VKApi, message: dict[str, Any]) -> bool:
+    conversation_message_id = int(message.get("conversation_message_id") or message.get("id") or 0)
+    if conversation_message_id <= 0:
+        return True
+    peer_id = int(message["peer_id"])
+    group_id = int(api.group_id or 0)
+    vk_message_id = int(message.get("id") or 0) or None
+    async with VkProcessedMessages() as processed:
+        return await processed.mark(group_id, peer_id, conversation_message_id, vk_message_id)
+
+
 class VKBotApp:
     def __init__(self, api: VKApi):
         self.api = api
@@ -132,11 +173,20 @@ class VKBotApp:
             return
 
         ctx = Ctx(api=self.api, state=self.state, update=update, message=message)
-        text = ctx.text.lower()
-        cmd = ctx.cmd
+        if not await is_new_message(self.api, message):
+            logger.info(
+                "Skipping duplicate VK message peer_id=%s conversation_message_id=%s",
+                ctx.peer_id,
+                message.get("conversation_message_id") or message.get("id"),
+            )
+            return
+
+        text = normalize_text_command(ctx.text)
+        cmd = ctx.cmd or TEXT_COMMAND_ALIASES.get(text, "")
+        logger.info("Incoming VK message peer_id=%s user_id=%s text=%r cmd=%r", ctx.peer_id, ctx.user_id, ctx.text, cmd)
 
         try:
-            if text in {"/start", "start", "начать"}:
+            if cmd == "start" or text in {"/start", "start", "начать"}:
                 await self.command_handlers["start"](ctx)
                 return
             if text == "/id":

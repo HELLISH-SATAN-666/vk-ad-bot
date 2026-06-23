@@ -5,6 +5,8 @@ from typing import Iterable, Optional
 
 
 Color = str
+MAX_INLINE_ROWS = 6
+MAX_INLINE_BUTTONS = 10
 
 
 def _payload(cmd: str, **data) -> str:
@@ -28,8 +30,21 @@ def link_button(label: str, link: str) -> dict:
 
 
 def keyboard(rows: Iterable[Iterable[dict]], inline: bool = True) -> str:
+    row_list = []
+    button_count = 0
+    for row in rows:
+        if len(row_list) >= MAX_INLINE_ROWS or button_count >= MAX_INLINE_BUTTONS:
+            break
+        next_row = []
+        for button in row:
+            if button_count >= MAX_INLINE_BUTTONS:
+                break
+            next_row.append(button)
+            button_count += 1
+        if next_row:
+            row_list.append(next_row)
     return json.dumps(
-        {"one_time": False, "inline": inline, "buttons": [list(row) for row in rows]},
+        {"one_time": False, "inline": inline, "buttons": row_list},
         ensure_ascii=False,
     )
 
@@ -107,12 +122,9 @@ def admin_menu() -> str:
     return keyboard(
         [
             [text_button("Реклама", "manage_all_ads", "primary")],
-            [text_button("Группы партнеров", "manage_partner_groups_admin")],
-            [text_button("Заявки на вывод", "manage_requests")],
-            [text_button("Ручные оплаты", "manual_payments")],
-            [text_button("Рассылка", "admin_newsletter")],
-            [text_button("Параметры", "admin_var_settings")],
-            [text_button("Подписки", "subs_stat_menu")],
+            [text_button("Группы партнеров", "manage_partner_groups_admin"), text_button("Заявки на вывод", "manage_requests")],
+            [text_button("Ручные оплаты", "manual_payments"), text_button("Рассылка", "admin_newsletter")],
+            [text_button("Параметры", "admin_var_settings"), text_button("Подписки", "subs_stat_menu")],
             [text_button("Статистика", "statistics")],
             [text_button("Назад", "main_menu", "negative")],
         ]
@@ -134,10 +146,10 @@ def categories_kb(categories: dict[str, str], selected: set[str]) -> str:
     rows = []
     rows.append([text_button(("✓ " if "0" in selected else "") + "Все", "select_category", category_id="0")])
     row = []
-    for category_id, category_name in categories.items():
+    for category_id, category_name in list(categories.items())[:8]:
         label = ("✓ " if category_id in selected else "") + category_name[:34]
         row.append(text_button(label, "select_category", category_id=category_id))
-        if len(row) == 2:
+        if len(row) == 4:
             rows.append(row)
             row = []
     if row:
@@ -149,7 +161,8 @@ def categories_kb(categories: dict[str, str], selected: set[str]) -> str:
 def number_select_kb(count: int, selected: set[str], confirm_cmd: str, back_cmd: Optional[str] = None) -> str:
     rows = []
     row = []
-    for i in range(1, count + 1):
+    max_numbers = 8 if back_cmd else 9
+    for i in range(1, min(count, max_numbers) + 1):
         value = str(i)
         row.append(text_button(("✓ " if value in selected else "") + value, "select_group", num=value))
         if len(row) == 5:
@@ -165,8 +178,15 @@ def number_select_kb(count: int, selected: set[str], confirm_cmd: str, back_cmd:
 
 def list_select_kb(items: list[dict], cmd: str, back_cmd: str, label_key: str = "title") -> str:
     rows = []
-    for item in items:
-        rows.append([text_button(str(item[label_key])[:40], cmd, item_id=item["id"])])
+    row = []
+    max_items = 9
+    for item in items[:max_items]:
+        row.append(text_button(str(item[label_key])[:32], cmd, item_id=item["id"]))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([text_button("Назад", back_cmd, "negative")])
     return keyboard(rows)
 
@@ -175,11 +195,15 @@ def manage_partner_group_kb(group_id: int, status: int, is_admin: bool = False) 
     rows = []
     if status != 0:
         rows.append([text_button("Заморозить", "partner_group_act.freeze", "negative", group_id=group_id)])
-    rows.append([text_button("Только подписки", "partner_group_act.sub_groups", "primary", group_id=group_id)])
-    rows.append([text_button("Только реклама", "partner_group_act.promotion", "primary", group_id=group_id)])
+    rows.append([
+        text_button("Только подписки", "partner_group_act.sub_groups", "primary", group_id=group_id),
+        text_button("Только реклама", "partner_group_act.promotion", "primary", group_id=group_id),
+    ])
     rows.append([text_button("Реклама и подписки", "partner_group_act.promotion_and_sub", "primary", group_id=group_id)])
-    rows.append([text_button("Расписание", "partner_group_schedule", group_id=group_id)])
-    rows.append([text_button("Удалить", "partner_group_act.delete", "negative", group_id=group_id)])
+    rows.append([
+        text_button("Расписание", "partner_group_schedule", group_id=group_id),
+        text_button("Удалить", "partner_group_act.delete", "negative", group_id=group_id),
+    ])
     rows.append([text_button("Назад", "manage_partner_groups_admin" if is_admin else "manage_partner_groups", "negative")])
     return keyboard(rows)
 
@@ -266,6 +290,6 @@ def open_bot_link(bot_group_id: int, ref_group_id: int, label: str = "Купит
 
 
 def subscription_check_kb(groups: list[tuple[int, str]], main_group_id: int) -> str:
-    rows = [[link_button(name[:40], f"https://vk.com/club{abs(group_id)}")] for group_id, name in groups]
+    rows = [[link_button(name[:40], f"https://vk.com/club{abs(group_id)}")] for group_id, name in groups[:5]]
     rows.append([text_button("Проверить подписку", "check_subs", "positive", main_group_id=main_group_id)])
     return keyboard(rows)

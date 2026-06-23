@@ -43,6 +43,23 @@ class VkGroups(Database):
         await self.execute("DELETE FROM vk_groups WHERE group_id = $1;", group_id)
 
 
+class VkProcessedMessages(Database):
+    async def mark(self, group_id: int, peer_id: int, conversation_message_id: int, vk_message_id: Optional[int] = None) -> bool:
+        row_id = await self.fetchval(
+            """
+            INSERT INTO vk_processed_messages(group_id, peer_id, conversation_message_id, vk_message_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (group_id, peer_id, conversation_message_id) DO NOTHING
+            RETURNING id;
+            """,
+            group_id,
+            peer_id,
+            conversation_message_id,
+            vk_message_id,
+        )
+        return row_id is not None
+
+
 async def apply_vk_schema() -> None:
     db = Database()
     await db.connect()
@@ -58,5 +75,23 @@ async def apply_vk_schema() -> None:
             can_wall_post BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS vk_processed_messages (
+            id BIGSERIAL PRIMARY KEY,
+            group_id BIGINT NOT NULL,
+            peer_id BIGINT NOT NULL,
+            conversation_message_id BIGINT NOT NULL,
+            vk_message_id BIGINT,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+    await db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS vk_processed_messages_uidx
+        ON vk_processed_messages(group_id, peer_id, conversation_message_id);
         """
     )
