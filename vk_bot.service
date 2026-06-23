@@ -1,0 +1,14 @@
+[Unit]
+Description=VK advertising bot
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vk-ad-bot
+ExecStart=/opt/vk-ad-bot/.venv/bin/python /opt/vk-ad-bot/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

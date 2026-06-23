@@ -1,0 +1,51 @@
+{
+  "subscriptions": {
+    "msg": [
+      {
+        "msg": 3,
+        "price_rub": 20
+      },
+      {
+        "msg": 8,
+        "price_rub": 40
+      },
+      {
+        "msg": 16,
+        "price_rub": 120
+      },
+      {
+        "msg": 28,
+        "price_rub": 180
+      },
+      {
+        "msg": 120,
+        "price_rub": 500
+      }
+    ],
+    "time": [
+      {
+        "duration": "7 дней",
+        "price_rub": 20
+      },
+      {
+        "duration": "1 месяц",
+        "price_rub": 50
+      },
+      {
+        "duration": "3 месяца",
+        "price_rub": 120
+      },
+      {
+        "duration": "6 месяцев",
+        "price_rub": 200
+      },
+      {
+        "duration": "1 год",
+        "price_rub": 300
+      }
+    ],
+    "none": [
+
+    ]
+  }
+}
