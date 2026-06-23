@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +13,25 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from database import AdGroups, ManualPayments, Newsletters, PartnerGroups, Partners, Posters, Users, UsersSubs
+from database import (
+    AdGroups,
+    AdGroupsStatus,
+    ManualPayments,
+    Newsletters,
+    PartnerGroups,
+    Partners,
+    Payments,
+    PaymentTypes,
+    Posters,
+    PosterStatus,
+    Queue,
+    Users,
+    UsersSubs,
+)
 from database.base import close_pool
 from database.schema import ensure_schema
 from utils.config import BASE_DIR, get_ad_categories
+from utils.services import get_msk_now
 from vkbot.api import VKGroupInfo
 from vkbot.app import VKBotApp
 from vkbot.handlers import register_handlers
@@ -129,7 +145,7 @@ async def main() -> None:
 
     await send(app, admin_id, "start")
     await send(app, admin_id, cmd="manage_partner_groups_admin")
-    await send(app, admin_id, cmd="partner_group_act.sub_groups", group_id=partner_group_db_id)
+    await send(app, admin_id, cmd="partner_group_act.promotion_and_sub", group_id=partner_group_db_id)
 
     first_category = next(iter(get_ad_categories().values()))
     await send(app, advertiser_id, "start")
@@ -145,6 +161,22 @@ async def main() -> None:
         all_posters = await posters.get_all()
         assert len(all_posters) == 1
         assert all_posters[0]["creator_id"] == advertiser_id
+        poster_id = all_posters[0]["id"]
+        assert await posters.get_by_status(PosterStatus.MODERATED)
+
+    await send(app, admin_id, cmd="poster_change_button", poster_id=poster_id)
+    await send(app, admin_id, "Новая кнопка")
+    async with Posters() as posters:
+        poster = await posters.get_by_id(poster_id)
+        assert poster["referral_button_name"] == "Новая кнопка"
+
+    await send(app, admin_id, cmd="poster_schedule_send", poster_id=poster_id)
+    await send(app, admin_id, cmd="poster_schedule_group", num="1")
+    schedule_time = (get_msk_now() + timedelta(minutes=5)).strftime("%H:%M")
+    await send(app, admin_id, schedule_time)
+    async with Queue() as queue:
+        events = await queue.get_group_events(3001)
+        assert any(event["poster_id"] == poster_id for event in events)
 
     await send(app, advertiser_id, cmd="buy_ad.group")
     await send(app, advertiser_id, "club4001")
@@ -159,6 +191,12 @@ async def main() -> None:
         groups = await ad_groups.get_all()
         assert len(groups) == 1
         assert groups[0]["group_id"] == 4001
+        assert await ad_groups.get_by_status(AdGroupsStatus.ACTIVE)
+
+    async with Payments() as payments:
+        ad_group_pays = await payments.get_all(pay_type=PaymentTypes.AD_GROUP)
+        assert len(ad_group_pays) == 1
+        assert ad_group_pays[0]["type"] == PaymentTypes.AD_GROUP
 
     subscriber_id = 222000003
     await send(app, subscriber_id, "start", ref="3001")

@@ -34,14 +34,14 @@ class AdGroups(Database):
         )
 
     async def get_by_status(self, status: AdGroupsStatus, creator_id: Optional[int] = None) -> list[Record]:
-        add_query = ";"
-        if creator_id:
-            add_query = f" AND creator_id = $2;"
+        query = "SELECT * FROM ad_groups WHERE status = $1"
+        args = [int(status)]
+        if creator_id is not None:
+            query += " AND creator_id = $2"
+            args.append(creator_id)
+        query += ";"
 
-        ad_groups = await self.fetch(
-            "SELECT * FROM ad_groups WHERE status = $1" + add_query,
-            int(status), creator_id
-        )
+        ad_groups = await self.fetch(query, *args)
 
         return ad_groups
 

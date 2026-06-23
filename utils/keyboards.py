@@ -176,6 +176,22 @@ def number_select_kb(count: int, selected: set[str], confirm_cmd: str, back_cmd:
     return keyboard(rows)
 
 
+def number_action_kb(count: int, cmd: str, back_cmd: Optional[str] = None) -> str:
+    rows = []
+    row = []
+    max_numbers = 8 if back_cmd else 9
+    for i in range(1, min(count, max_numbers) + 1):
+        row.append(text_button(str(i), cmd, num=str(i)))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if back_cmd:
+        rows.append([text_button("Назад", back_cmd, "negative")])
+    return keyboard(rows)
+
+
 def list_select_kb(items: list[dict], cmd: str, back_cmd: str, label_key: str = "title") -> str:
     rows = []
     row = []
@@ -236,6 +252,8 @@ def poster_admin_kb(poster_id: int, status: int) -> str:
     elif status == 2:
         rows.append([text_button("Активировать", "poster_act.activate", "positive", poster_id=poster_id)])
     rows.append([text_button("Выбрать площадки", "poster_select_groups", "primary", poster_id=poster_id)])
+    rows.append([text_button("Текст кнопки", "poster_change_button", "primary", poster_id=poster_id)])
+    rows.append([text_button("Запланировать пост", "poster_schedule_send", "primary", poster_id=poster_id)])
     rows.append([text_button("Удалить", "poster_act.delete", "negative", poster_id=poster_id)])
     rows.append([text_button("Назад", "manage_all_ads", "negative")])
     return keyboard(rows)

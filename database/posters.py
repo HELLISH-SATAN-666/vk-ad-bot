@@ -45,14 +45,14 @@ class Posters(Database):
         )
 
     async def get_by_status(self, status: PosterStatus, creator_id: Optional[int] = None) -> list[Record]:
-        add_query = " "
-        if creator_id:
-            add_query = f" AND creator_id = $2 "
+        query = "SELECT * FROM posters WHERE status = $1"
+        args = [int(status)]
+        if creator_id is not None:
+            query += " AND creator_id = $2"
+            args.append(creator_id)
+        query += " ORDER BY id;"
 
-        posters = await self.fetch(
-            "SELECT * FROM posters WHERE status = $1" + add_query + "ORDER BY id;",
-            int(status), creator_id
-        )
+        posters = await self.fetch(query, *args)
 
         return posters
 

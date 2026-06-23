@@ -42,9 +42,9 @@ class Payments(Database):
 
 
         for db_var, var in {"from_user": from_user, "to_user": to_user, "type": pay_type}.items():
-            if var:
+            if var is not None:
                 add_queries.append(db_var + " = {}")
-                query_args.append(var)
+                query_args.append(int(var) if isinstance(var, PaymentTypes) else var)
 
         if len(query_args) > 0:
             add_queries = [q.format("$" + str(i + 1)) for i, q in enumerate(add_queries)]

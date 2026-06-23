@@ -34,6 +34,7 @@ from utils.services import (
     activate_payment_state,
     add_counter,
     edit_rate,
+    get_msk_now,
     get_suitable_groups,
     moderate_newsletter,
     reject_payment,
@@ -242,6 +243,53 @@ async def _show_ad_group(ctx: Ctx, ad_group_db_id: int) -> None:
         return
     title = await ctx.api.group_title(ad_group["group_id"])
     await ctx.answer(texts.admin_ad_group_text(ad_group, title), keyboard=kb.ad_group_admin_kb(ad_group["id"], ad_group["status"]))
+
+
+async def _poster_target_groups(poster_id: int) -> tuple[Any, list[Any]]:
+    async with Posters() as posters:
+        poster = await posters.get_by_id(poster_id)
+    if not poster:
+        return None, []
+
+    groups_data = await get_suitable_groups(poster)
+    all_groups = []
+    seen = set()
+    for group in groups_data["suitable_groups"] + groups_data["selected_groups"]:
+        if group["group_id"] not in seen:
+            seen.add(group["group_id"])
+            all_groups.append(group)
+    return poster, all_groups
+
+
+async def _show_poster_schedule_groups(ctx: Ctx, poster_id: int) -> None:
+    poster, all_groups = await _poster_target_groups(poster_id)
+    if not poster:
+        await ctx.answer("Объявление не найдено.", keyboard=kb.back("manage_ad_posts"))
+        return
+    if not all_groups:
+        await ctx.answer("Нет подходящих площадок для этого объявления.", keyboard=kb.back("manage_ad_posts"))
+        return
+
+    values = [group["group_id"] for group in all_groups]
+    text = ["Выберите площадку для отправки:"]
+    for index, group in enumerate(all_groups, 1):
+        text.append(f"{index}) {await ctx.api.group_title(group['group_id'])}")
+    text.append("")
+    text.append("Можно нажать кнопку с номером или отправить номер сообщением.")
+    ctx.update_data(schedule_poster_id=poster_id, schedule_group_values=values)
+    ctx.set_state("poster_schedule_group")
+    await ctx.answer("\n".join(text), keyboard=kb.number_action_kb(len(values), "poster_schedule_group", "manage_ad_posts"))
+
+
+async def _select_poster_schedule_group(ctx: Ctx, raw_num: str) -> None:
+    values = ctx.data.get("schedule_group_values") or []
+    if not raw_num.isdigit() or int(raw_num) < 1 or int(raw_num) > len(values):
+        await ctx.answer("Неверный номер площадки.")
+        return
+    group_id = int(values[int(raw_num) - 1])
+    ctx.update_data(schedule_group_id=group_id)
+    await ctx.answer("Введите время отправки по МСК в формате 18:00.")
+    ctx.set_state("poster_schedule_time")
 
 
 def register_handlers(app: VKBotApp) -> None:
@@ -677,6 +725,74 @@ def register_handlers(app: VKBotApp) -> None:
                 for group in suitable:
                     await partner_groups.add_posters(group["group_id"], poster_id)
         await ctx.answer("Статус объявления изменен.")
+        await _show_poster(ctx, poster_id)
+
+    @app.command("poster_change_button")
+    async def poster_change_button(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        poster_id = int(ctx.payload["poster_id"])
+        ctx.update_data(change_button_poster_id=poster_id)
+        await ctx.answer("Введите новый текст реферальной кнопки.")
+        ctx.set_state("poster_button_name")
+
+    @app.state_handler("poster_button_name")
+    async def poster_button_name(ctx: Ctx) -> None:
+        button_name = ctx.text.strip()
+        if not button_name:
+            await ctx.answer("Текст кнопки не должен быть пустым.")
+            return
+        poster_id = int(ctx.data["change_button_poster_id"])
+        async with Posters() as posters:
+            await posters.change_button_name(poster_id, button_name[:80])
+        ctx.clear_state()
+        await ctx.answer("Текст кнопки обновлен.")
+        await _show_poster(ctx, poster_id)
+
+    @app.command("poster_schedule_send")
+    async def poster_schedule_send(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await _show_poster_schedule_groups(ctx, int(ctx.payload["poster_id"]))
+
+    @app.command("poster_schedule_group")
+    async def poster_schedule_group(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await _select_poster_schedule_group(ctx, str(ctx.payload.get("num") or ""))
+
+    @app.state_handler("poster_schedule_group")
+    async def poster_schedule_group_state(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await _select_poster_schedule_group(ctx, ctx.text)
+
+    @app.state_handler("poster_schedule_time")
+    async def poster_schedule_time(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        raw_time = ctx.text.replace(".", ":")
+        parts = raw_time.split(":")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            await ctx.answer("Неверный формат времени. Пример: 18:00.")
+            return
+        hour, minute = map(int, parts)
+        if hour > 23 or minute > 59:
+            await ctx.answer("Неверное время. Пример: 18:00.")
+            return
+
+        now = get_msk_now()
+        activate_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if activate_time < now:
+            await ctx.answer("Это время сегодня уже прошло. Введите будущее время по МСК.")
+            return
+
+        poster_id = int(ctx.data["schedule_poster_id"])
+        group_id = int(ctx.data["schedule_group_id"])
+        async with Queue() as queue:
+            await queue.add(activate_time, group_id, poster_id)
+        ctx.clear_state()
+        await ctx.answer(f"Пост запланирован на {activate_time.strftime('%H:%M')} МСК.")
         await _show_poster(ctx, poster_id)
 
     @app.command("poster_select_groups")
