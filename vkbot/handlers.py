@@ -23,6 +23,7 @@ from database import (
     RequestType,
     UserRequests,
     Users,
+    UsersSubs,
     UserStatus,
     VkGroups,
 )
@@ -124,6 +125,86 @@ async def _ensure_user(ctx: Ctx) -> None:
             )
 
 
+async def _subscription_groups(ctx: Ctx, main_group_id: int) -> list[tuple[int, str]]:
+    async with PartnerGroups() as partner_groups:
+        need_group_ids = await partner_groups.get_active_need_group_ids(main_group_id)
+    groups = []
+    for group_id in need_group_ids:
+        groups.append((group_id, await ctx.api.group_title(group_id)))
+    return groups
+
+
+async def _send_subscription_prompt(ctx: Ctx, main_group_id: int) -> bool:
+    groups = await _subscription_groups(ctx, main_group_id)
+    if not groups:
+        return False
+    group_names = "\n".join(f"- {name}" for _, name in groups)
+    await ctx.answer(
+        "Для доступа необходимо подписаться на следующие VK-сообщества:\n\n" + group_names,
+        keyboard=kb.subscription_check_kb(groups, main_group_id),
+    )
+    return True
+
+
+async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
+    groups = await _subscription_groups(ctx, main_group_id)
+    if not groups:
+        await ctx.answer("Для этой площадки сейчас нет активных подписочных условий.")
+        return False
+
+    missing = []
+    for group_id, title in groups:
+        try:
+            if not await ctx.api.is_group_member(group_id, ctx.user_id):
+                missing.append(title)
+        except Exception:
+            logger.exception("Failed to check VK membership for user=%s group=%s", ctx.user_id, group_id)
+            missing.append(title)
+
+    if missing:
+        await ctx.answer("Вы еще не подписаны на все нужные сообщества:\n\n" + "\n".join(f"- {name}" for name in missing))
+        return False
+
+    async with UsersSubs() as subs:
+        await subs.add_sub(ctx.user_id, main_group_id, "sub_msg")
+    await add_counter(EventType.SUB_BUTTON_PRESSED)
+    await ctx.answer("Подписка подтверждена. Доступ выдан.")
+    return True
+
+
+async def _chat_guard(ctx: Ctx) -> bool:
+    if ctx.peer_id <= 2_000_000_000:
+        return False
+
+    async with PartnerGroups() as partner_groups:
+        partner_group = await partner_groups.get_by_group_id(ctx.peer_id)
+    if not partner_group or partner_group["partner_type"] not in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
+        return False
+
+    async with UsersSubs() as subs:
+        if await subs.in_db(ctx.user_id, ctx.peer_id):
+            return True
+
+    groups = await _subscription_groups(ctx, ctx.peer_id)
+    if not groups:
+        return True
+
+    for group_id, _ in groups:
+        if not await ctx.api.is_group_member(group_id, ctx.user_id):
+            message_id = ctx.message.get("id")
+            if message_id:
+                try:
+                    await ctx.api.delete_message(int(message_id), delete_for_all=True)
+                except Exception:
+                    logger.exception("Failed to delete message %s in VK chat", message_id)
+            await _send_subscription_prompt(ctx, ctx.peer_id)
+            return False
+
+    async with UsersSubs() as subs:
+        await subs.add_sub(ctx.user_id, ctx.peer_id, "sub_msg")
+    return True
+
+
 async def _show_partner_group(ctx: Ctx, group_db_id: int, is_admin_choice: bool = False) -> None:
     async with PartnerGroups() as partner_groups:
         group = await partner_groups.get_by_db_id(group_db_id)
@@ -166,6 +247,10 @@ async def _show_ad_group(ctx: Ctx, ad_group_db_id: int) -> None:
 def register_handlers(app: VKBotApp) -> None:
     @app.default
     async def default(ctx: Ctx) -> None:
+        if await _chat_guard(ctx):
+            return
+        if ctx.peer_id > 2_000_000_000:
+            return
         await start(ctx)
 
     @app.command("start")
@@ -173,7 +258,18 @@ def register_handlers(app: VKBotApp) -> None:
     async def start(ctx: Ctx) -> None:
         ctx.clear_state()
         await _ensure_user(ctx)
+        if ctx.ref and str(ctx.ref).lstrip("-").isdigit():
+            if await _send_subscription_prompt(ctx, int(ctx.ref)):
+                return
         await ctx.answer(texts.WELCOME_TEXT, keyboard=kb.main_menu(_is_admin(ctx.user_id)))
+
+    @app.command("check_subs")
+    async def check_subs(ctx: Ctx) -> None:
+        main_group_id = int(ctx.payload.get("main_group_id") or ctx.ref or 0)
+        if not main_group_id:
+            await ctx.answer("Не понял, для какой площадки проверять подписку.")
+            return
+        await _check_and_grant_subscription(ctx, main_group_id)
 
     @app.command("menu_advertiser")
     async def advertiser_menu(ctx: Ctx) -> None:
@@ -358,14 +454,24 @@ def register_handlers(app: VKBotApp) -> None:
     @app.state_handler("partner_group_id")
     async def partner_group_id_state(ctx: Ctx) -> None:
         group_ref, token = _extract_group_and_token(ctx.text)
-        try:
-            group = await ctx.api.resolve_group(group_ref)
-        except Exception:
-            await ctx.answer("Не смог найти VK-сообщество. Проверьте ссылку/id и повторите.")
-            return
+        if group_ref.lstrip("-").isdigit() and int(group_ref) > 2_000_000_000:
+            group_id = int(group_ref)
+            group_name = f"VK chat {group_id}"
+            group_screen = ""
+            target_type = "chat"
+        else:
+            try:
+                group = await ctx.api.resolve_group(group_ref)
+            except Exception:
+                await ctx.answer("Не смог найти VK-сообщество/чат. Проверьте ссылку/id и повторите.")
+                return
+            group_id = group.id
+            group_name = group.name
+            group_screen = group.screen_name
+            target_type = "community"
         async with VkGroups() as vk_groups:
-            await vk_groups.upsert(group.id, title=group.name, screen_name=group.screen_name, token=token, can_wall_post=bool(token))
-        ctx.update_data(partner_group_id=group.id, partner_group_token=token)
+            await vk_groups.upsert(group_id, title=group_name, screen_name=group_screen, token=token, target_type=target_type, can_wall_post=bool(token))
+        ctx.update_data(partner_group_id=group_id, partner_group_token=token)
         await ctx.answer(texts.SELECT_REGION_PARTNER_TEXT)
         ctx.set_state("partner_region")
 
@@ -813,6 +919,14 @@ def register_handlers(app: VKBotApp) -> None:
         if not await _admin_required(ctx):
             return
         await ctx.answer(await texts.main_statistics_text(), keyboard=kb.back("menu_adminpanel"))
+
+    @app.command("subs_stat_menu")
+    async def subs_stat_menu(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        async with UsersSubs() as subs:
+            count = await subs.count()
+        await ctx.answer(f"Подтвержденных подписочных доступов: {count}", keyboard=kb.back("menu_adminpanel"))
 
     @app.command("settings_plains")
     async def settings_plains(ctx: Ctx) -> None:

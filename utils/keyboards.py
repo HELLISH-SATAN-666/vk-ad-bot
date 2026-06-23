@@ -112,6 +112,7 @@ def admin_menu() -> str:
             [text_button("Ручные оплаты", "manual_payments")],
             [text_button("Рассылка", "admin_newsletter")],
             [text_button("Параметры", "admin_var_settings")],
+            [text_button("Подписки", "subs_stat_menu")],
             [text_button("Статистика", "statistics")],
             [text_button("Назад", "main_menu", "negative")],
         ]
@@ -262,3 +263,9 @@ def newsletter_type_kb() -> str:
 def open_bot_link(bot_group_id: int, ref_group_id: int, label: str = "Купить рекламу") -> str:
     link = f"https://vk.com/write-{bot_group_id}?ref={ref_group_id}"
     return keyboard([[link_button(label, link)]])
+
+
+def subscription_check_kb(groups: list[tuple[int, str]], main_group_id: int) -> str:
+    rows = [[link_button(name[:40], f"https://vk.com/club{abs(group_id)}")] for group_id, name in groups]
+    rows.append([text_button("Проверить подписку", "check_subs", "positive", main_group_id=main_group_id)])
+    return keyboard(rows)

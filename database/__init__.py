@@ -9,4 +9,5 @@ from .posters import Posters, PosterStatus
 from .queue import Queue
 from .user_requests import RequestStatus, RequestType, UserRequests
 from .users import Users, UserStatus
+from .users_subs import UsersSubs
 from .vk_meta import VkGroups

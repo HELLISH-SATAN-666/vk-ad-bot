@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS users_subs_info (
 CREATE UNIQUE INDEX IF NOT EXISTS users_user_id_uidx ON users(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS partners_user_id_uidx ON partners(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS partner_groups_group_id_uidx ON partner_groups(group_id);
+CREATE UNIQUE INDEX IF NOT EXISTS users_subs_info_user_group_uidx ON users_subs_info(user_id, group_id);
 """
 
 

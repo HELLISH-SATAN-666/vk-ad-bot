@@ -112,6 +112,9 @@ class VKApi:
             params["keyboard"] = keyboard
         await self.call("messages.edit", **params)
 
+    async def delete_message(self, message_id: int, delete_for_all: bool = True) -> None:
+        await self.call("messages.delete", message_ids=message_id, delete_for_all=1 if delete_for_all else 0)
+
     async def get_user_name(self, user_id: int) -> str:
         response = await self.call("users.get", user_ids=user_id)
         if not response:
