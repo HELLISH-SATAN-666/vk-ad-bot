@@ -89,6 +89,7 @@ class Ctx:
 
 
 Handler = Callable[[Ctx], Any]
+WallPostHandler = Callable[[VKApi, dict[str, Any]], Any]
 
 
 TEXT_COMMAND_ALIASES = {
@@ -102,6 +103,8 @@ TEXT_COMMAND_ALIASES = {
     "доступ по подписке": "buy_ad.group",
     "рассылка": "buy_ad.newsletter",
     "добавить площадку": "add_bot_group",
+    "сохранить ключ": "add_vk_group_token",
+    "добавить ключ": "add_vk_group_token",
     "профиль": "partner_profile",
     "вывод средств": "money_requests",
     "управление площадками": "manage_partner_groups",
@@ -139,6 +142,7 @@ class VKBotApp:
         self.prefix_handlers: list[tuple[str, Handler]] = []
         self.state_handlers: dict[str, Handler] = {}
         self.default_handler: Optional[Handler] = None
+        self.wall_post_handler: Optional[WallPostHandler] = None
 
     def command(self, cmd: str):
         def decorator(func: Handler):
@@ -165,15 +169,26 @@ class VKBotApp:
         self.default_handler = func
         return func
 
-    async def handle_update(self, update: dict[str, Any]) -> None:
+    def wall_post(self, func: WallPostHandler):
+        self.wall_post_handler = func
+        return func
+
+    async def handle_update(self, update: dict[str, Any], api: Optional[VKApi] = None, guard_only: bool = False) -> None:
+        active_api = api or self.api
+        if update.get("type") == "wall_post_new":
+            if self.wall_post_handler:
+                await self.wall_post_handler(active_api, update)
+            return
         if update.get("type") != "message_new":
             return
         message = update.get("object", {}).get("message") or update.get("object") or {}
         if not message or message.get("out"):
             return
+        if guard_only and int(message.get("peer_id") or 0) <= 2_000_000_000:
+            return
 
-        ctx = Ctx(api=self.api, state=self.state, update=update, message=message)
-        if not await is_new_message(self.api, message):
+        ctx = Ctx(api=active_api, state=self.state, update=update, message=message)
+        if not await is_new_message(active_api, message):
             logger.info(
                 "Skipping duplicate VK message peer_id=%s conversation_message_id=%s",
                 ctx.peer_id,
@@ -186,6 +201,13 @@ class VKBotApp:
         logger.info("Incoming VK message peer_id=%s user_id=%s text=%r cmd=%r", ctx.peer_id, ctx.user_id, ctx.text, cmd)
 
         try:
+            if guard_only:
+                if cmd == "check_subs":
+                    await self.command_handlers["check_subs"](ctx)
+                elif not cmd and self.default_handler:
+                    await self.default_handler(ctx)
+                return
+
             if cmd == "start" or text in {"/start", "start", "начать"}:
                 await self.command_handlers["start"](ctx)
                 return

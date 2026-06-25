@@ -24,6 +24,7 @@ from database import (
     Queue,
     UserStatus,
     Users,
+    UsersSubs,
     VkGroups,
 )
 from database.ad_groups import AdGroupsStatus
@@ -154,7 +155,8 @@ async def send_poster_to_group(api: VKApi, group_id: int, poster, text: Optional
         return False
     should_close = group_api is not api
     try:
-        await group_api.wall_post(group_id, wall_text, attachments=attachment)
+        post_id = await group_api.wall_post(group_id, wall_text, attachments=attachment)
+        logger.info("Posted poster %s to VK wall %s as post %s", poster["id"], group_id, post_id)
         return True
     except Exception:
         logger.exception("Failed to post poster to VK wall %s", group_id)
@@ -199,13 +201,14 @@ async def send_newsletter(
 async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
     from_user = int(payment_state["from_user"])
     price = int(payment_state["current_pay_info"]["sum"])
-    period = int(payment_state["sub_period"])
+    period = int(payment_state.get("sub_period") or 0)
     ad_type = payment_state["ad_type"]
 
     async with Users() as users:
         if not await users.in_db(from_user):
             await users.add(from_user)
-        await users.update_status(from_user, UserStatus.ADVERTISER)
+        if ad_type in {"poster", "group", "newsletter"}:
+            await users.update_status(from_user, UserStatus.ADVERTISER)
         db_user = await users.get_user(from_user)
 
     match ad_type:
@@ -247,6 +250,28 @@ async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
             pay_type = PaymentTypes.NEWSLETTER
             await api.send_message(from_user, "Оплата подтверждена. Рассылка отправлена на модерацию.", keyboard=kb.advertiser_menu())
             await send_log(api, "В бот добавлена новая рассылка от рекламодателя.")
+
+        case "sub_access":
+            group_id = int(payment_state["access_group_id"])
+            rate_type = str(payment_state["access_rate_type"])
+            rate = payment_state["access_rate"]
+            async with UsersSubs() as subs:
+                if rate_type == "msg":
+                    await subs.add_msg_sub(from_user, group_id, int(rate["msg"]))
+                    access_text = f"{int(rate['msg'])} сообщений"
+                elif rate_type == "time":
+                    existing = await subs.get_sub(from_user, group_id)
+                    base_time = get_msk_now()
+                    if existing and str(existing["type"]).strip() == "time" and existing["expires_at"] and existing["expires_at"] > base_time:
+                        base_time = existing["expires_at"]
+                    expires_at = base_time + timedelta(days=int(rate["days"]))
+                    await subs.upsert_time_sub(from_user, group_id, expires_at)
+                    access_text = f"до {expires_at.strftime('%d.%m.%Y %H:%M')} МСК"
+                else:
+                    raise ValueError(f"Unknown sub access rate_type: {rate_type}")
+            pay_type = PaymentTypes.SUB_ACCESS
+            await api.send_message(from_user, f"Оплата подтверждена. Доступ к площадке club{group_id}: {access_text}.")
+            await send_log(api, f"Оплачен доступ к VK-площадке club{group_id}: {access_text}.")
 
         case _:
             raise ValueError(f"Unknown ad_type: {ad_type}")
@@ -306,12 +331,19 @@ async def check_for_poster_events(api: VKApi) -> None:
     if not events:
         return
 
+    handled_event_ids = []
     async with Posters() as posters:
         for event in events:
             poster = await posters.get_by_id(event["poster_id"])
             if not poster:
+                handled_event_ids.append(event["id"])
                 continue
-            await send_poster_to_group(api, int(event["group_id"]), poster)
+            if await send_poster_to_group(api, int(event["group_id"]), poster):
+                handled_event_ids.append(event["id"])
+
+    if handled_event_ids:
+        async with Queue() as queue:
+            await queue.delete(handled_event_ids)
 
 
 async def check_for_all_events(api: VKApi) -> None:

@@ -13,6 +13,7 @@ from database import (
     PartnerTypes,
     PaymentTypes,
     Payments,
+    RequestStatus,
     UserRequests,
     Users,
     UserStatus,
@@ -46,8 +47,19 @@ ADD_PARTNER_GROUP = (
     "Отправьте ссылку, короткое имя или ID VK-сообщества/площадки.\n\n"
     "Для публикации рекламы на стену чужого сообщества нужен токен этого сообщества с правами wall/photos/messages. "
     "Можно отправить так:\n"
-    "club123456 token=vk1.a.xxxxx\n\n"
+    "club123456 token=vk1.a.xxxxx\n"
+    "или так:\n"
+    "club123456 vk1.a.xxxxx\n\n"
     "Без token площадка будет добавлена для учета и подписочных проверок, но автопубликация на стену может быть недоступна."
+)
+
+ADD_VK_GROUP_TOKEN_TEXT = (
+    "Отправьте VK-сообщество и его ключ доступа в одном сообщении.\n\n"
+    "Этот режим только сохраняет ключ и не добавляет сообщество как вашу рекламную площадку.\n"
+    "Формат:\n"
+    "club123456 vk1.a.xxxxx\n"
+    "или:\n"
+    "club123456 token=vk1.a.xxxxx"
 )
 
 SELECT_REGION_AD_TEXT = (
@@ -133,10 +145,16 @@ def payment_instruction(period: int, price: int) -> str:
 
 
 def manual_pay_request_text(pay_sum: int, pay_detail: str, user_id: int, ad_type: str) -> str:
+    type_names = {
+        "poster": "рекламное объявление",
+        "group": "рекламная группа",
+        "newsletter": "рассылка",
+        "sub_access": "доступ к площадке",
+    }
     return (
-        "Новый запрос на покупку рекламы\n\n"
+        "Новый запрос на оплату\n\n"
         f"Пользователь VK: {user_id}\n"
-        f"Тип рекламы: {ad_type}\n"
+        f"Тип: {type_names.get(ad_type, ad_type)}\n"
         f"Сумма платежа: {pay_sum} ₽\n"
         f"Примечание к платежу:\n{pay_detail or 'Нет'}"
     )
@@ -217,11 +235,15 @@ def partner_group_text(group: Record | dict, title: str = "Недоступно"
     region_text = ", ".join(regions.get(str(code), str(code)) for code in (group["region_codes"] or []))
     cats = group["poster_categories"] or []
     category_text = "все" if 0 in cats else ", ".join(categories.get(str(code), str(code)) for code in cats)
+    rate_type = str(group["sub_rate_type"] or "none").strip() if "sub_rate_type" in group else "none"
+    rate_text = {"none": "без оплаты", "time": "по времени", "msg": "по сообщениям"}.get(rate_type, rate_type)
     return (
         f"Площадка: {title}\n"
         f"VK ID: {group['group_id']}\n"
         f"Тип: {statuses.get(group['partner_type'], group['partner_type'])}\n"
+        f"Тариф доступа: {rate_text}\n"
         f"Подключено рекламы: {len(group['show_ad_ids'] or [])}\n"
+        f"Групп для подписки: {len(group['need_groups'] or [])}\n"
         f"Регионы: {region_text or '-'}\n"
         f"Категории: {category_text or '-'}"
     )
@@ -282,6 +304,7 @@ def nl_results_text(total: int, success: int, target: str) -> str:
     target_to_ru = {
         "partners": "партнеры",
         "subs": "подписчики",
+        "sub": "подписчик",
         "advertisers": "рекламодатели",
         "partners_and_subs": "подписчики и партнеры",
     }
@@ -291,6 +314,124 @@ def nl_results_text(total: int, success: int, target: str) -> str:
         f"Всего пользователей: {total}\n"
         f"Удалось отправить: {success} ({percent}%)"
     )
+
+
+def _short_text(value: str, limit: int = 700) -> str:
+    value = value or ""
+    return value if len(value) <= limit else value[: limit - 3] + "..."
+
+
+async def _vk_user_label(api, user_id: int) -> str:
+    try:
+        name = await api.get_user_name(int(user_id))
+    except Exception:
+        name = "Недоступно"
+    return f"{name} (VK ID: {user_id})"
+
+
+def admin_nl_text(nls: list[Record]) -> str:
+    if not nls:
+        return "На данный момент нет рассылок от администратора."
+
+    target_names = {
+        int(NewslettersTarget.SUBS): "подписчикам",
+        int(NewslettersTarget.SUB): "подписчику",
+        int(NewslettersTarget.PARTNERS): "партнерам",
+        int(NewslettersTarget.ADVERTISERS): "рекламодателям",
+        int(NewslettersTarget.PARTNERS_AND_SUBS): "партнерам и подписчикам",
+    }
+    rows = ["Все рассылки от администраторов\n"]
+    for nl in nls:
+        created = nl["creation_time"].strftime("%d.%m.%Y %H:%M") if nl["creation_time"] else "-"
+        target = target_names.get(int(nl["target"]), str(nl["target"]))
+        rows.append(f"Рассылка #{nl['id']} {target} ({created})")
+        rows.append(_short_text(nl["text"], 500))
+        rows.append("")
+    return "\n".join(rows).strip()
+
+
+async def advert_nl_text(api, nls: list[Record], current_nl_id: int) -> str:
+    if not nls:
+        return "На данный момент нет активных рассылок от рекламодателей."
+
+    target_names = {
+        int(NewslettersTarget.SUBS): "подписчики",
+        int(NewslettersTarget.PARTNERS): "партнеры",
+        int(NewslettersTarget.PARTNERS_AND_SUBS): "партнеры и подписчики",
+    }
+    current_nl = nls[current_nl_id]
+    send_at = current_nl["send_time"] or time(15, 0)
+    created = current_nl["creation_time"].strftime("%d.%m.%Y %H:%M") if current_nl["creation_time"] else "-"
+    expires_at = current_nl["expires_at"].strftime("%d.%m.%Y") if current_nl["expires_at"] else "-"
+    status = "на модерации" if current_nl["is_moderating"] else "активна"
+    author = await _vk_user_label(api, int(current_nl["creator_id"]))
+
+    return (
+        f"Рассылка от рекламодателя {current_nl_id + 1}/{len(nls)}\n\n"
+        f"ID: {current_nl['id']}\n"
+        f"Рекламодатель: {author}\n"
+        f"Цель: {target_names.get(int(current_nl['target']), current_nl['target'])}\n"
+        f"Статус: {status}\n"
+        f"Дата покупки: {created}\n"
+        f"Дата окончания: {expires_at}\n"
+        f"Время публикации: {send_at.strftime('%H:%M')} МСК\n\n"
+        f"Текст:\n{_short_text(current_nl['text'], 1200)}"
+    )
+
+
+async def partner_stats_text(api, partner_info: Record) -> str:
+    partner_id = int(partner_info["user_id"])
+    partner_name = await _vk_user_label(api, partner_id)
+
+    async with Users() as users:
+        referrals_info = await users.get_referrals(partner_id)
+
+    rows = [f"Партнер: {partner_name}", f"Баланс: {partner_info['balance']} ₽", "", "Рефералы:"]
+    if not referrals_info:
+        rows.append("- Нет")
+    for referral in referrals_info[:20]:
+        referral_id = int(referral["user_id"])
+        async with Payments() as payments:
+            all_ref_payments = await payments.get_all(from_user=referral_id)
+        payment_sum = sum(pay["sum"] for pay in all_ref_payments)
+        referral_name = await _vk_user_label(api, referral_id)
+        rows.append(f"- {referral_name}: куплено рекламы на {payment_sum} ₽")
+    if len(referrals_info) > 20:
+        rows.append(f"- Еще {len(referrals_info) - 20} рефералов не показаны в сообщении")
+
+    rows.extend(["", "Успешные выводы:"])
+    async with UserRequests() as requests:
+        success_reqs = await requests.get_requests(partner_id, RequestStatus.APPROVED)
+    if not success_reqs:
+        rows.append("- Нет")
+    for req in success_reqs[:20]:
+        rows.append(f"- Вывод {req['amount']} ₽ на реквизиты: {_short_text(req['comment'] or '-', 120)}")
+    if len(success_reqs) > 20:
+        rows.append(f"- Еще {len(success_reqs) - 20} выводов не показаны в сообщении")
+    return "\n".join(rows)
+
+
+async def subs_statistics_text(api) -> str:
+    async with Users() as users:
+        subs_info = await users.get_users_by_status(UserStatus.NO_ROLE)
+
+    rows = [f"Все подписчики: {len(subs_info)}"]
+    if not subs_info:
+        rows.append("- Нет")
+        return "\n".join(rows)
+
+    async with Users() as users:
+        for sub_info in subs_info[:50]:
+            user = await users.get_user(int(sub_info["user_id"]))
+            sub_name = await _vk_user_label(api, int(sub_info["user_id"]))
+            referral_text = ""
+            if user and user["referral_user_id"] is not None:
+                referral_name = await _vk_user_label(api, int(user["referral_user_id"]))
+                referral_text = f" (пришел от партнера {referral_name})"
+            rows.append(f"- {sub_name}{referral_text}")
+    if len(subs_info) > 50:
+        rows.append(f"- Еще {len(subs_info) - 50} подписчиков не показаны в сообщении")
+    return "\n".join(rows)
 
 
 async def main_statistics_text() -> str:
@@ -303,6 +444,7 @@ async def main_statistics_text() -> str:
         user_count = await users.get_user_count()
     events = await get_all_periods_events(EventType.SUB_BUTTON_PRESSED)
     pays = await get_all_periods_pays()
+    adverts_events = await get_all_periods_events(EventType.ADDED_NEW_ADVERT)
     return (
         "Статистика по боту\n\n"
         f"Всего пользователей: {user_count}\n"
@@ -318,7 +460,12 @@ async def main_statistics_text() -> str:
         f"- 7 дней: {pays['7 days'] or 0} ₽\n"
         f"- Месяц: {pays['1 month'] or 0} ₽\n"
         f"- Год: {pays['1 year'] or 0} ₽\n"
-        f"- Все время: {pays['all_time'] or 0} ₽"
+        f"- Все время: {pays['all_time'] or 0} ₽\n\n"
+        "Пришло рекламодателей:\n"
+        f"- 7 дней: {adverts_events['7 days']}\n"
+        f"- Месяц: {adverts_events['1 month']}\n"
+        f"- Год: {adverts_events['1 year']}\n"
+        f"- Все время: {adverts_events['all_time']}"
     )
 
 

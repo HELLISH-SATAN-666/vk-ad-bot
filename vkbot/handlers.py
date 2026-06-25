@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import time
-from os import getenv
+from datetime import date, time, timedelta
+from os import environ, getenv
 from typing import Any
 
 from dotenv import set_key
@@ -27,6 +27,7 @@ from database import (
     UserStatus,
     VkGroups,
 )
+from database.partner_groups import normalize_sub_rates
 from utils import keyboards as kb
 from utils import texts
 from utils.config import BASE_DIR, get_ad_categories, get_admins, get_regions, get_settings_var_names
@@ -42,17 +43,28 @@ from utils.services import (
     send_newsletter,
 )
 from vkbot.app import Ctx, VKBotApp
+from vkbot.api import VKApi
 
 
 logger = logging.getLogger(__name__)
 
 
-def _is_admin(user_id: int) -> bool:
+def _is_config_admin(user_id: int) -> bool:
     return user_id in get_admins()
 
 
+async def _is_admin(ctx: Ctx) -> bool:
+    if _is_config_admin(ctx.user_id):
+        return True
+    try:
+        return await ctx.api.is_group_manager(ctx.user_id)
+    except Exception:
+        logger.exception("Failed to check VK community admin rights for user=%s", ctx.user_id)
+        return False
+
+
 async def _admin_required(ctx: Ctx) -> bool:
-    if _is_admin(ctx.user_id):
+    if await _is_admin(ctx):
         return True
     await ctx.answer("Нет доступа.")
     return False
@@ -99,18 +111,97 @@ def _payment_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
             state["newsletter_text"] = data["newsletter_text"]
             state["newsletter_attachment"] = data.get("newsletter_attachment")
             state["newsletter_target"] = data["newsletter_target"]
+        case "sub_access":
+            state["access_group_id"] = int(data["access_group_id"])
+            state["access_rate_type"] = data["access_rate_type"]
+            state["access_rate"] = data["access_rate"]
     return state
 
 
 def _extract_group_and_token(text: str) -> tuple[str, str | None]:
-    if "token=" not in text:
-        return text.strip(), None
-    group_ref, token = text.split("token=", 1)
-    return group_ref.strip(), token.strip().split()[0]
+    text = text.strip()
+    marker = "token="
+    marker_pos = text.lower().find(marker)
+    if marker_pos != -1:
+        group_ref = text[:marker_pos].strip()
+        token_parts = text[marker_pos + len(marker) :].strip().split()
+        return group_ref, token_parts[0] if token_parts else None
+
+    parts = text.split()
+    if len(parts) == 2 and (parts[1].startswith("vk1.") or len(parts[1]) >= 40):
+        return parts[0], parts[1]
+
+    return text, None
+
+
+def _split_group_refs(text: str) -> list[str]:
+    refs = []
+    for part in text.replace("\n", " ").replace(",", " ").replace(";", " ").split():
+        ref = part.strip()
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def _sub_rate_type(group: dict | Any) -> str:
+    return str(group.get("sub_rate_type") if isinstance(group, dict) else group["sub_rate_type"] or "none").strip() or "none"
+
+
+def _sub_rates(group: dict | Any) -> dict[str, list[dict[str, int]]]:
+    raw = group.get("sub_rates") if isinstance(group, dict) else group["sub_rates"]
+    return normalize_sub_rates(raw)
+
+
+def _rate_label(rate_type: str, rate: dict[str, int]) -> str:
+    if rate_type == "msg":
+        return f"{int(rate['msg'])} сообщений - {int(rate['price_rub'])} ₽"
+    days = int(rate["days"])
+    if days % 365 == 0:
+        period = f"{days // 365} год" if days == 365 else f"{days // 365} лет"
+    elif days % 30 == 0:
+        period = f"{days // 30} мес."
+    else:
+        period = f"{days} дн."
+    return f"{period} - {int(rate['price_rub'])} ₽"
+
+
+def _format_access_rates(group: dict | Any) -> str:
+    rate_type = _sub_rate_type(group)
+    rates = _sub_rates(group)
+    type_text = {"none": "без оплаты", "time": "по времени", "msg": "по количеству сообщений"}.get(rate_type, rate_type)
+    lines = [f"Текущий режим: {type_text}", ""]
+    for current_type, title in (("time", "Тарифы по времени"), ("msg", "Тарифы по сообщениям")):
+        lines.append(title + ":")
+        values = rates.get(current_type) or []
+        if not values:
+            lines.append("- не настроены")
+        for index, rate in enumerate(values, 1):
+            lines.append(f"{index}. {_rate_label(current_type, rate)}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _parse_access_rates(raw: str, rate_type: str) -> list[dict[str, int]] | None:
+    rates = []
+    for line in raw.splitlines():
+        clean = line.replace("=", " ").replace(",", " ").strip()
+        if not clean:
+            continue
+        parts = clean.split()
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            return None
+        amount, price = map(int, parts)
+        if amount <= 0 or price <= 0:
+            return None
+        if rate_type == "msg":
+            rates.append({"msg": amount, "price_rub": price})
+        else:
+            rates.append({"days": amount, "price_rub": price})
+    return rates or None
 
 
 async def _ensure_user(ctx: Ctx) -> None:
-    is_admin = _is_admin(ctx.user_id)
+    is_admin = await _is_admin(ctx)
     referral_user_id = None
     ref = ctx.ref
     if ref and str(ref).lstrip("-").isdigit():
@@ -126,13 +217,130 @@ async def _ensure_user(ctx: Ctx) -> None:
             )
 
 
-async def _subscription_groups(ctx: Ctx, main_group_id: int) -> list[tuple[int, str]]:
+async def _subscription_groups_for_api(api: VKApi, main_group_id: int) -> list[tuple[int, str]]:
     async with PartnerGroups() as partner_groups:
         need_group_ids = await partner_groups.get_active_need_group_ids(main_group_id)
     groups = []
     for group_id in need_group_ids:
-        groups.append((group_id, await ctx.api.group_title(group_id)))
+        groups.append((group_id, await api.group_title(group_id)))
     return groups
+
+
+async def _subscription_groups(ctx: Ctx, main_group_id: int) -> list[tuple[int, str]]:
+    return await _subscription_groups_for_api(ctx.api, main_group_id)
+
+
+async def _is_group_member_for_api(api: VKApi, group_id: int, user_id: int) -> bool:
+    async with VkGroups() as vk_groups:
+        meta = await vk_groups.get(abs(int(group_id)))
+    token = meta and meta["token"]
+    if token and abs(int(group_id)) != abs(int(api.group_id or 0)):
+        group_api = VKApi(token, group_id=abs(int(group_id)), api_version=api.api_version)
+        try:
+            return await group_api.is_group_member(group_id, user_id)
+        except Exception as exc:
+            logger.warning("Stored VK token failed for membership check group=%s; falling back: %s", group_id, exc)
+        finally:
+            await group_api.close()
+    return await api.is_group_member(group_id, user_id)
+
+
+async def _is_group_member(ctx: Ctx, group_id: int, user_id: int) -> bool:
+    return await _is_group_member_for_api(ctx.api, group_id, user_id)
+
+
+async def _missing_subscription_groups(api: VKApi, main_group_id: int, user_id: int) -> list[tuple[int, str]]:
+    missing = []
+    for group_id, title in await _subscription_groups_for_api(api, main_group_id):
+        try:
+            if not await _is_group_member_for_api(api, group_id, user_id):
+                missing.append((group_id, title))
+        except Exception:
+            logger.exception("Failed to check VK membership for user=%s group=%s", user_id, group_id)
+            missing.append((group_id, title))
+    return missing
+
+
+async def _paid_access_status(group: Any, user_id: int) -> tuple[bool, str]:
+    rate_type = _sub_rate_type(group)
+    if rate_type not in ("time", "msg"):
+        return True, ""
+
+    group_id = int(group["group_id"])
+    async with UsersSubs() as subs:
+        sub = await subs.get_sub(user_id, group_id)
+        if not sub or str(sub["type"]).strip() != rate_type:
+            return False, "not_paid"
+        if rate_type == "time":
+            expires_at = sub["expires_at"]
+            if expires_at and expires_at > get_msk_now():
+                return True, ""
+            await subs.remove_sub(user_id, group_id)
+            return False, "expired"
+        msg_left = sub["msg_left"]
+        if msg_left is not None and int(msg_left) > 0:
+            return True, ""
+        await subs.remove_sub(user_id, group_id)
+        return False, "messages_left"
+
+
+async def _consume_paid_message(group: Any, user_id: int) -> None:
+    if _sub_rate_type(group) != "msg":
+        return
+    group_id = int(group["group_id"])
+    async with UsersSubs() as subs:
+        msg_left = await subs.reduce_msg_left(user_id, group_id)
+        if msg_left is not None and int(msg_left) <= 0:
+            await subs.remove_sub(user_id, group_id)
+
+
+def _paid_access_text(group: Any, reason: str = "not_paid") -> str:
+    title = "Для размещения на этой площадке нужно купить доступ."
+    if reason == "expired":
+        title = "Оплаченный доступ по времени закончился."
+    elif reason == "messages_left":
+        title = "Оплаченные сообщения закончились."
+    rate_type = _sub_rate_type(group)
+    rates = _sub_rates(group).get(rate_type) or []
+    lines = [title, "", "Доступные тарифы:"]
+    for index, rate in enumerate(rates, 1):
+        lines.append(f"{index}. {_rate_label(rate_type, rate)}")
+    return "\n".join(lines)
+
+
+def _paid_access_kb(group: Any) -> str:
+    rate_type = _sub_rate_type(group)
+    rows = []
+    for index, rate in enumerate((_sub_rates(group).get(rate_type) or [])[:5]):
+        rows.append([kb.text_button(_rate_label(rate_type, rate)[:40], "buy_group_access", "primary", main_group_id=int(group["group_id"]), rate_index=index)])
+    return kb.keyboard(rows)
+
+
+async def _send_paid_access_prompt(ctx: Ctx, group: Any, reason: str = "not_paid") -> bool:
+    if _sub_rate_type(group) not in ("time", "msg"):
+        return False
+    await ctx.answer(_paid_access_text(group, reason), keyboard=_paid_access_kb(group))
+    return True
+
+
+async def _send_paid_access_prompt_to_user(api: VKApi, user_id: int, group: Any, reason: str = "not_paid") -> None:
+    await api.send_message(user_id, _paid_access_text(group, reason), keyboard=_paid_access_kb(group))
+
+
+async def _subscription_partner_group(ctx: Ctx):
+    if ctx.peer_id <= 2_000_000_000:
+        return None
+
+    candidates = [ctx.peer_id]
+    if ctx.api.group_id:
+        candidates.append(abs(int(ctx.api.group_id)))
+
+    async with PartnerGroups() as partner_groups:
+        for group_id in dict.fromkeys(candidates):
+            partner_group = await partner_groups.get_by_group_id(group_id)
+            if partner_group and partner_group["partner_type"] in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
+                return partner_group
+    return None
 
 
 async def _send_subscription_prompt(ctx: Ctx, main_group_id: int) -> bool:
@@ -148,22 +356,23 @@ async def _send_subscription_prompt(ctx: Ctx, main_group_id: int) -> bool:
 
 
 async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
+    async with PartnerGroups() as partner_groups:
+        partner_group = await partner_groups.get_by_group_id(main_group_id)
+    if partner_group:
+        has_paid_access, reason = await _paid_access_status(partner_group, ctx.user_id)
+        if not has_paid_access:
+            await _send_paid_access_prompt(ctx, partner_group, reason)
+            return False
+
     groups = await _subscription_groups(ctx, main_group_id)
     if not groups:
-        await ctx.answer("Для этой площадки сейчас нет активных подписочных условий.")
+        await ctx.answer("Для этой площадки сейчас нет активных подписочных условий или доступ уже выдан.")
         return False
 
-    missing = []
-    for group_id, title in groups:
-        try:
-            if not await ctx.api.is_group_member(group_id, ctx.user_id):
-                missing.append(title)
-        except Exception:
-            logger.exception("Failed to check VK membership for user=%s group=%s", ctx.user_id, group_id)
-            missing.append(title)
+    missing = await _missing_subscription_groups(ctx.api, main_group_id, ctx.user_id)
 
     if missing:
-        await ctx.answer("Вы еще не подписаны на все нужные сообщества:\n\n" + "\n".join(f"- {name}" for name in missing))
+        await ctx.answer("Вы еще не подписаны на все нужные сообщества:\n\n" + "\n".join(f"- {name}" for _, name in missing))
         return False
 
     async with UsersSubs() as subs:
@@ -174,36 +383,110 @@ async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
 
 
 async def _chat_guard(ctx: Ctx) -> bool:
-    if ctx.peer_id <= 2_000_000_000:
+    partner_group = await _subscription_partner_group(ctx)
+    if not partner_group:
+        return False
+    source_group_id = int(partner_group["group_id"])
+
+    has_paid_access, paid_reason = await _paid_access_status(partner_group, ctx.user_id)
+    if not has_paid_access:
+        message_id = ctx.message.get("id")
+        if message_id:
+            try:
+                await ctx.api.delete_message(int(message_id), delete_for_all=True)
+            except Exception:
+                logger.exception("Failed to delete message %s in VK chat", message_id)
+        await _send_paid_access_prompt(ctx, partner_group, paid_reason)
         return False
 
-    async with PartnerGroups() as partner_groups:
-        partner_group = await partner_groups.get_by_group_id(ctx.peer_id)
-    if not partner_group or partner_group["partner_type"] not in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
-        return False
-
-    async with UsersSubs() as subs:
-        if await subs.in_db(ctx.user_id, ctx.peer_id):
-            return True
-
-    groups = await _subscription_groups(ctx, ctx.peer_id)
+    groups = await _subscription_groups(ctx, source_group_id)
     if not groups:
+        await _consume_paid_message(partner_group, ctx.user_id)
         return True
 
-    for group_id, _ in groups:
-        if not await ctx.api.is_group_member(group_id, ctx.user_id):
-            message_id = ctx.message.get("id")
-            if message_id:
-                try:
-                    await ctx.api.delete_message(int(message_id), delete_for_all=True)
-                except Exception:
-                    logger.exception("Failed to delete message %s in VK chat", message_id)
-            await _send_subscription_prompt(ctx, ctx.peer_id)
-            return False
+    missing = await _missing_subscription_groups(ctx.api, source_group_id, ctx.user_id)
+    if missing:
+        message_id = ctx.message.get("id")
+        if message_id:
+            try:
+                await ctx.api.delete_message(int(message_id), delete_for_all=True)
+            except Exception:
+                logger.exception("Failed to delete message %s in VK chat", message_id)
+        await _send_subscription_prompt(ctx, source_group_id)
+        return False
 
     async with UsersSubs() as subs:
-        await subs.add_sub(ctx.user_id, ctx.peer_id, "sub_msg")
+        await subs.add_sub(ctx.user_id, source_group_id, "sub_msg")
+    await _consume_paid_message(partner_group, ctx.user_id)
     return True
+
+
+async def _wall_post_guard(api: VKApi, update: dict[str, Any]) -> None:
+    obj = update.get("object") or {}
+    owner_id = int(obj.get("owner_id") or 0)
+    source_group_id = abs(int(update.get("group_id") or 0))
+    if not source_group_id and owner_id < 0:
+        source_group_id = abs(owner_id)
+    if not source_group_id and api.group_id:
+        source_group_id = abs(int(api.group_id))
+
+    post_id = int(obj.get("id") or obj.get("post_id") or 0)
+    user_id = int(obj.get("from_id") or obj.get("signer_id") or obj.get("created_by") or 0)
+    if source_group_id <= 0 or post_id <= 0 or user_id <= 0:
+        return
+
+    try:
+        if await api.is_group_manager(user_id, source_group_id):
+            return
+    except Exception:
+        logger.exception("Failed to check wall author manager rights user=%s group=%s", user_id, source_group_id)
+
+    async with PartnerGroups() as partner_groups:
+        partner_group = await partner_groups.get_by_group_id(source_group_id)
+    if not partner_group or partner_group["partner_type"] not in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
+        return
+
+    has_paid_access, paid_reason = await _paid_access_status(partner_group, user_id)
+    if not has_paid_access:
+        try:
+            await api.delete_wall_post(source_group_id, post_id)
+        except Exception:
+            logger.exception("Failed to delete wall post post=%s group=%s", post_id, source_group_id)
+            return
+        try:
+            await _send_paid_access_prompt_to_user(api, user_id, partner_group, paid_reason)
+        except Exception as exc:
+            logger.warning("Failed to notify wall post author about paid access user=%s group=%s: %s", user_id, source_group_id, exc)
+        return
+
+    groups = await _subscription_groups_for_api(api, source_group_id)
+    if not groups:
+        await _consume_paid_message(partner_group, user_id)
+        return
+
+    missing = await _missing_subscription_groups(api, source_group_id, user_id)
+    if not missing:
+        async with UsersSubs() as subs:
+            await subs.add_sub(user_id, source_group_id, "sub_msg")
+        await _consume_paid_message(partner_group, user_id)
+        return
+
+    try:
+        await api.delete_wall_post(source_group_id, post_id)
+    except Exception:
+        logger.exception("Failed to delete wall post post=%s group=%s", post_id, source_group_id)
+        return
+
+    missing_text = "\n".join(f"- {title}" for _, title in missing)
+    try:
+        await api.send_message(
+            user_id,
+            "Ваш пост удален: перед размещением нужно подписаться на сообщества:\n\n"
+            f"{missing_text}\n\nПосле подписки отправьте пост еще раз.",
+            keyboard=kb.subscription_check_kb(groups, source_group_id),
+        )
+    except Exception as exc:
+        logger.warning("Failed to notify wall post author user=%s group=%s: %s", user_id, source_group_id, exc)
 
 
 async def _show_partner_group(ctx: Ctx, group_db_id: int, is_admin_choice: bool = False) -> None:
@@ -220,6 +503,28 @@ async def _show_partner_group(ctx: Ctx, group_db_id: int, is_admin_choice: bool 
         texts.partner_group_text(group, title),
         keyboard=kb.manage_partner_group_kb(group_db_id, group["partner_type"], is_admin_choice),
     )
+
+
+async def _show_partner_group_rates(ctx: Ctx, group_db_id: int, is_admin_choice: bool = False) -> None:
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(group_db_id)
+    if not group:
+        await ctx.answer("Площадка не найдена.")
+        return
+    rows = [
+        [
+            kb.text_button("Без оплаты", "partner_group_rate_type.none", "primary", group_id=group_db_id),
+            kb.text_button("По времени", "partner_group_rate_type.time", "primary", group_id=group_db_id),
+            kb.text_button("По сообщениям", "partner_group_rate_type.msg", "primary", group_id=group_db_id),
+        ],
+        [
+            kb.text_button("Ред. время", "partner_group_edit_rates", group_id=group_db_id, rate_type="time"),
+            kb.text_button("Ред. сообщения", "partner_group_edit_rates", group_id=group_db_id, rate_type="msg"),
+        ],
+        [kb.text_button("Назад", "open_partner_group", "negative", item_id=group_db_id)],
+    ]
+    ctx.update_data(is_admin_choice=is_admin_choice)
+    await ctx.answer(_format_access_rates(group), keyboard=kb.keyboard(rows))
 
 
 async def _show_poster(ctx: Ctx, poster_id: int) -> None:
@@ -292,7 +597,110 @@ async def _select_poster_schedule_group(ctx: Ctx, raw_num: str) -> None:
     ctx.set_state("poster_schedule_time")
 
 
+def _parse_hh_mm(raw_value: str) -> time | None:
+    parts = raw_value.replace(".", ":").split(":")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return None
+    hour, minute = map(int, parts)
+    if hour > 23 or minute > 59:
+        return None
+    return time(hour, minute)
+
+
+def _parse_dd_mm_yyyy(raw_value: str) -> date | None:
+    parts = raw_value.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts) or len(parts[2]) != 4:
+        return None
+    day, month, year = map(int, parts)
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+async def _show_newsletter(ctx: Ctx, nl_id: int) -> None:
+    async with Newsletters() as newsletters:
+        nl = await newsletters.get_by_id(nl_id)
+    if not nl or not nl["expires_at"]:
+        await ctx.answer("Рассылка не найдена.")
+        return
+
+    send_time = nl["send_time"].strftime("%H:%M") if nl["send_time"] else "15:00"
+    await ctx.answer(
+        f"Рассылка #{nl['id']}\n"
+        f"Автор: {nl['creator_id']}\n"
+        f"До: {nl['expires_at'].strftime('%d.%m.%Y')}\n"
+        f"Время публикации: {send_time} МСК\n\n"
+        f"{nl['text']}",
+        keyboard=kb.keyboard(
+            [
+                [kb.text_button("Принять", "newsletter_act.apply", "positive", nl_id=nl_id)],
+                [
+                    kb.text_button("Время публикации", "newsletter_change_time", nl_id=nl_id),
+                    kb.text_button("Дата окончания", "newsletter_change_expires", nl_id=nl_id),
+                ],
+                [kb.text_button("Отклонить", "newsletter_act.delete", "negative", nl_id=nl_id)],
+                [kb.text_button("Назад", "newsletter_moderation", "negative")],
+            ]
+        ),
+        attachment=nl["file_id"],
+    )
+
+
+async def _show_partner_statistics(ctx: Ctx, cursor: int = 0) -> None:
+    async with Partners() as partners:
+        partners_info = await partners.get_all()
+    if not partners_info:
+        await ctx.answer("На данный момент в боте нет партнеров.", keyboard=kb.back("statistics"))
+        return
+
+    cursor = max(0, min(cursor, len(partners_info) - 1))
+    ctx.update_data(partner_stats_cursor=cursor)
+    await ctx.answer(
+        await texts.partner_stats_text(ctx.api, partners_info[cursor]),
+        keyboard=kb.partner_stats_kb(len(partners_info), cursor),
+    )
+
+
+async def _show_admin_newsletters_statistics(ctx: Ctx, offset: int = 0) -> None:
+    page_size = 5
+    async with Newsletters() as newsletters:
+        nls = await newsletters.get_all()
+    if not nls:
+        await ctx.answer("На данный момент нет рассылок от администратора.", keyboard=kb.back("newsletter_statistics"))
+        return
+
+    offset = max(0, min(offset, max(0, len(nls) - 1)))
+    offset -= offset % page_size
+    ctx.update_data(admin_newsletters_offset=offset)
+    await ctx.answer(
+        texts.admin_nl_text(nls[offset : offset + page_size]),
+        keyboard=kb.admin_newsletters_page_kb(len(nls), offset, page_size),
+    )
+
+
+async def _show_advert_newsletter_statistics(ctx: Ctx, cursor: int = 0) -> None:
+    async with Newsletters() as newsletters:
+        nls = await newsletters.get_all(is_sub=True)
+    if not nls:
+        await ctx.answer("На данный момент нет рассылок от рекламодателей.", keyboard=kb.back("newsletter_statistics"))
+        return
+
+    cursor = max(0, min(cursor, len(nls) - 1))
+    current_nl = nls[cursor]
+    ctx.update_data(advert_newsletter_cursor=cursor, advert_newsletter_id=int(current_nl["id"]))
+    await ctx.answer(
+        await texts.advert_nl_text(ctx.api, nls, cursor),
+        keyboard=kb.advert_newsletter_kb(len(nls), cursor, bool(current_nl["is_moderating"])),
+        attachment=current_nl["file_id"],
+    )
+
+
 def register_handlers(app: VKBotApp) -> None:
+    @app.wall_post
+    async def wall_post(api: VKApi, update: dict[str, Any]) -> None:
+        await _wall_post_guard(api, update)
+
     @app.default
     async def default(ctx: Ctx) -> None:
         if await _chat_guard(ctx):
@@ -307,9 +715,16 @@ def register_handlers(app: VKBotApp) -> None:
         ctx.clear_state()
         await _ensure_user(ctx)
         if ctx.ref and str(ctx.ref).lstrip("-").isdigit():
-            if await _send_subscription_prompt(ctx, int(ctx.ref)):
+            ref_group_id = int(ctx.ref)
+            async with PartnerGroups() as partner_groups:
+                partner_group = await partner_groups.get_by_group_id(ref_group_id)
+            if partner_group:
+                has_paid_access, paid_reason = await _paid_access_status(partner_group, ctx.user_id)
+                if not has_paid_access and await _send_paid_access_prompt(ctx, partner_group, paid_reason):
+                    return
+            if await _send_subscription_prompt(ctx, ref_group_id):
                 return
-        await ctx.answer(texts.WELCOME_TEXT, keyboard=kb.main_menu(_is_admin(ctx.user_id)))
+        await ctx.answer(texts.WELCOME_TEXT, keyboard=kb.main_menu(await _is_admin(ctx)))
 
     @app.command("check_subs")
     async def check_subs(ctx: Ctx) -> None:
@@ -318,6 +733,40 @@ def register_handlers(app: VKBotApp) -> None:
             await ctx.answer("Не понял, для какой площадки проверять подписку.")
             return
         await _check_and_grant_subscription(ctx, main_group_id)
+
+    @app.command("buy_group_access")
+    async def buy_group_access(ctx: Ctx) -> None:
+        main_group_id = int(ctx.payload.get("main_group_id") or 0)
+        rate_index = int(ctx.payload.get("rate_index") or 0)
+        async with PartnerGroups() as partner_groups:
+            group = await partner_groups.get_by_group_id(main_group_id)
+        if not group or _sub_rate_type(group) not in ("time", "msg"):
+            await ctx.answer("Для этой площадки сейчас нет платных тарифов.")
+            return
+        rate_type = _sub_rate_type(group)
+        rates = _sub_rates(group).get(rate_type) or []
+        if rate_index < 0 or rate_index >= len(rates):
+            await ctx.answer("Тариф не найден.")
+            return
+        rate = rates[rate_index]
+        price = int(rate["price_rub"])
+        ctx.clear_state()
+        ctx.update_data(
+            ad_type="sub_access",
+            from_user=ctx.user_id,
+            sub_period=int(rate.get("days") or rate.get("msg") or 0),
+            current_pay_info={"sum": price},
+            access_group_id=main_group_id,
+            access_rate_type=rate_type,
+            access_rate=rate,
+        )
+        await ctx.answer(
+            f"Выбран тариф: {_rate_label(rate_type, rate)}\n\n"
+            f"К оплате: {price} ₽.\n\n"
+            "YooMoney будет подключен последним этапом, сейчас покупка оформляется через ручное подтверждение.\n"
+            "Отправьте сюда комментарий к платежу или скриншот. Админ подтвердит заявку, после чего доступ активируется."
+        )
+        ctx.set_state("pay_details")
 
     @app.command("menu_advertiser")
     async def advertiser_menu(ctx: Ctx) -> None:
@@ -390,7 +839,7 @@ def register_handlers(app: VKBotApp) -> None:
         values = ctx.data.get("select_group_values") or []
         selected = _selected(ctx.data)
         num = str(ctx.payload.get("num") or "")
-        if not num or int(num) < 1 or int(num) > len(values):
+        if not num.isdigit() or int(num) < 1 or int(num) > len(values):
             await ctx.answer("Неверный номер.")
             return
         selected.remove(num) if num in selected else selected.add(num)
@@ -499,6 +948,35 @@ def register_handlers(app: VKBotApp) -> None:
         await ctx.answer(texts.ADD_PARTNER_GROUP, keyboard=kb.back("menu_partner"))
         ctx.set_state("partner_group_id")
 
+    @app.command("add_vk_group_token")
+    async def add_vk_group_token(ctx: Ctx) -> None:
+        await ctx.answer(texts.ADD_VK_GROUP_TOKEN_TEXT, keyboard=kb.back("menu_partner"))
+        ctx.set_state("vk_group_token")
+
+    @app.state_handler("vk_group_token")
+    async def vk_group_token_state(ctx: Ctx) -> None:
+        group_ref, token = _extract_group_and_token(ctx.text)
+        if not group_ref or not token:
+            await ctx.answer("Нужно отправить сообщество и ключ в одном сообщении. Пример: club123456 vk1.a.xxxxx")
+            return
+        try:
+            group = await ctx.api.resolve_group(group_ref)
+        except Exception:
+            await ctx.answer("Не смог найти VK-сообщество. Проверьте ссылку/id и повторите.")
+            return
+
+        async with VkGroups() as vk_groups:
+            await vk_groups.upsert(
+                group.id,
+                title=group.name,
+                screen_name=group.screen_name,
+                token=token,
+                target_type="community",
+                can_wall_post=True,
+            )
+        ctx.clear_state()
+        await ctx.answer(f"Ключ сохранен для {group.name} (club{group.id}).", keyboard=kb.partner_menu())
+
     @app.state_handler("partner_group_id")
     async def partner_group_id_state(ctx: Ctx) -> None:
         group_ref, token = _extract_group_and_token(ctx.text)
@@ -520,7 +998,8 @@ def register_handlers(app: VKBotApp) -> None:
         async with VkGroups() as vk_groups:
             await vk_groups.upsert(group_id, title=group_name, screen_name=group_screen, token=token, target_type=target_type, can_wall_post=bool(token))
         ctx.update_data(partner_group_id=group_id, partner_group_token=token)
-        await ctx.answer(texts.SELECT_REGION_PARTNER_TEXT)
+        token_status = "Токен принят, автопубликация на стену будет доступна." if token else "Токен не указан, автопубликация на стену будет недоступна."
+        await ctx.answer(f"{token_status}\n\n{texts.SELECT_REGION_PARTNER_TEXT}")
         ctx.set_state("partner_region")
 
     @app.state_handler("partner_region")
@@ -636,6 +1115,204 @@ def register_handlers(app: VKBotApp) -> None:
     @app.command("open_partner_group")
     async def open_partner_group(ctx: Ctx) -> None:
         await _show_partner_group(ctx, int(ctx.payload["item_id"]), bool(ctx.data.get("is_admin_choice")))
+
+    @app.command("partner_group_need_groups")
+    async def partner_group_need_groups(ctx: Ctx) -> None:
+        group_db_id = int(ctx.payload["group_id"])
+        is_admin_choice = bool(ctx.data.get("is_admin_choice"))
+        if is_admin_choice and not await _admin_required(ctx):
+            return
+        async with PartnerGroups() as partner_groups:
+            group = await partner_groups.get_by_db_id(group_db_id)
+        if not group:
+            await ctx.answer("Площадка не найдена.")
+            return
+        if not is_admin_choice and group["creator_id"] != ctx.user_id:
+            if await _is_admin(ctx):
+                is_admin_choice = True
+            else:
+                await ctx.answer("Нет доступа к этой площадке.")
+                return
+
+        current = []
+        for group_id in group["need_groups"] or []:
+            current.append(f"- {await ctx.api.group_title(group_id)} (club{abs(int(group_id))})")
+        text = [
+            "Отправьте VK-сообщества, на которые пользователь должен подписаться перед размещением поста.",
+            "Можно отправить ссылки, club/id или несколько групп через пробел/перенос строки.",
+            "Чтобы очистить список, отправьте 0.",
+            "",
+            "Текущий список:",
+            *(current or ["- пусто"]),
+        ]
+        ctx.update_data(need_group_partner_db_id=group_db_id, need_group_is_admin_choice=is_admin_choice)
+        ctx.set_state("partner_group_need_groups")
+        await ctx.answer(
+            "\n".join(text),
+            keyboard=kb.keyboard([[kb.text_button("Назад", "open_partner_group", "negative", item_id=group_db_id)]]),
+        )
+
+    @app.state_handler("partner_group_need_groups")
+    async def partner_group_need_groups_state(ctx: Ctx) -> None:
+        group_db_id = int(ctx.data.get("need_group_partner_db_id") or 0)
+        is_admin_choice = bool(ctx.data.get("need_group_is_admin_choice"))
+        if not group_db_id:
+            ctx.clear_state()
+            await ctx.answer("Не нашел площадку для настройки.")
+            return
+        if is_admin_choice and not await _admin_required(ctx):
+            return
+        async with PartnerGroups() as partner_groups:
+            group = await partner_groups.get_by_db_id(group_db_id)
+        if not group:
+            ctx.clear_state()
+            await ctx.answer("Площадка не найдена.")
+            return
+        if not is_admin_choice and group["creator_id"] != ctx.user_id:
+            if await _is_admin(ctx):
+                is_admin_choice = True
+            else:
+                ctx.clear_state()
+                await ctx.answer("Нет доступа к этой площадке.")
+                return
+
+        raw = ctx.text.strip()
+        if raw.casefold() in {"0", "-", "нет", "очистить"}:
+            group_ids: list[int] = []
+        else:
+            if "token=" in raw.lower() or "vk1." in raw:
+                await ctx.answer("В этом поле нужны только ссылки/id групп. Ключи сохраняйте отдельной кнопкой «Сохранить ключ».")
+                return
+            refs = _split_group_refs(raw)
+            if not refs:
+                await ctx.answer("Отправьте хотя бы одну группу или 0 для очистки.")
+                return
+            group_ids = []
+            seen = set()
+            for ref in refs:
+                try:
+                    need_group = await ctx.api.resolve_group(ref)
+                except Exception:
+                    await ctx.answer(f"Не смог найти VK-сообщество: {ref}")
+                    return
+                if need_group.id in seen:
+                    continue
+                seen.add(need_group.id)
+                group_ids.append(need_group.id)
+                async with VkGroups() as vk_groups:
+                    await vk_groups.upsert(
+                        need_group.id,
+                        title=need_group.name,
+                        screen_name=need_group.screen_name,
+                        target_type="community",
+                    )
+
+        async with PartnerGroups() as partner_groups:
+            await partner_groups.replace_group_need_groups(int(group["group_id"]), group_ids)
+        ctx.clear_state()
+        ctx.update_data(is_admin_choice=is_admin_choice)
+        await ctx.answer(f"Группы подписки обновлены: {len(group_ids)}.")
+        await _show_partner_group(ctx, group_db_id, is_admin_choice)
+
+    @app.command("partner_group_rates")
+    async def partner_group_rates(ctx: Ctx) -> None:
+        group_db_id = int(ctx.payload["group_id"])
+        is_admin_choice = bool(ctx.data.get("is_admin_choice"))
+        if is_admin_choice and not await _admin_required(ctx):
+            return
+        async with PartnerGroups() as partner_groups:
+            group = await partner_groups.get_by_db_id(group_db_id)
+        if not group:
+            await ctx.answer("Площадка не найдена.")
+            return
+        if not is_admin_choice and group["creator_id"] != ctx.user_id:
+            if await _is_admin(ctx):
+                is_admin_choice = True
+            else:
+                await ctx.answer("Нет доступа к этой площадке.")
+                return
+        await _show_partner_group_rates(ctx, group_db_id, is_admin_choice)
+
+    @app.command_prefix("partner_group_rate_type.")
+    async def partner_group_rate_type(ctx: Ctx) -> None:
+        group_db_id = int(ctx.payload["group_id"])
+        rate_type = ctx.cmd.split(".")[-1]
+        is_admin_choice = bool(ctx.data.get("is_admin_choice"))
+        if is_admin_choice and not await _admin_required(ctx):
+            return
+        async with PartnerGroups() as partner_groups:
+            group = await partner_groups.get_by_db_id(group_db_id)
+            if not group:
+                await ctx.answer("Площадка не найдена.")
+                return
+            if not is_admin_choice and group["creator_id"] != ctx.user_id:
+                if await _is_admin(ctx):
+                    is_admin_choice = True
+                else:
+                    await ctx.answer("Нет доступа к этой площадке.")
+                    return
+            await partner_groups.change_sub_rate_type(int(group["group_id"]), rate_type)
+        ctx.update_data(is_admin_choice=is_admin_choice)
+        await ctx.answer("Режим тарифа обновлен.")
+        await _show_partner_group_rates(ctx, group_db_id, is_admin_choice)
+
+    @app.command("partner_group_edit_rates")
+    async def partner_group_edit_rates(ctx: Ctx) -> None:
+        group_db_id = int(ctx.payload["group_id"])
+        rate_type = str(ctx.payload["rate_type"])
+        is_admin_choice = bool(ctx.data.get("is_admin_choice"))
+        if rate_type not in ("time", "msg"):
+            await ctx.answer("Неверный тип тарифа.")
+            return
+        if is_admin_choice and not await _admin_required(ctx):
+            return
+        async with PartnerGroups() as partner_groups:
+            group = await partner_groups.get_by_db_id(group_db_id)
+        if not group:
+            await ctx.answer("Площадка не найдена.")
+            return
+        if not is_admin_choice and group["creator_id"] != ctx.user_id:
+            if await _is_admin(ctx):
+                is_admin_choice = True
+            else:
+                await ctx.answer("Нет доступа к этой площадке.")
+                return
+        ctx.update_data(edit_rates_partner_db_id=group_db_id, edit_rates_type=rate_type, edit_rates_is_admin_choice=is_admin_choice)
+        ctx.set_state("partner_group_rates")
+        if rate_type == "time":
+            await ctx.answer("Отправьте тарифы по времени, каждая строка: дней цена.\nПример:\n7 200\n30 500")
+        else:
+            await ctx.answer("Отправьте тарифы по сообщениям, каждая строка: сообщений цена.\nПример:\n3 200\n10 500")
+
+    @app.state_handler("partner_group_rates")
+    async def partner_group_rates_state(ctx: Ctx) -> None:
+        group_db_id = int(ctx.data.get("edit_rates_partner_db_id") or 0)
+        rate_type = str(ctx.data.get("edit_rates_type") or "")
+        is_admin_choice = bool(ctx.data.get("edit_rates_is_admin_choice"))
+        rates = _parse_access_rates(ctx.text, rate_type)
+        if not group_db_id or rate_type not in ("time", "msg") or not rates:
+            await ctx.answer("Неверный формат. Каждая строка должна быть: число цена.")
+            return
+        if is_admin_choice and not await _admin_required(ctx):
+            return
+        async with PartnerGroups() as partner_groups:
+            group = await partner_groups.get_by_db_id(group_db_id)
+            if not group:
+                ctx.clear_state()
+                await ctx.answer("Площадка не найдена.")
+                return
+            if not is_admin_choice and group["creator_id"] != ctx.user_id:
+                if await _is_admin(ctx):
+                    is_admin_choice = True
+                else:
+                    ctx.clear_state()
+                    await ctx.answer("Нет доступа к этой площадке.")
+                    return
+            await partner_groups.replace_sub_rates(int(group["group_id"]), rate_type, rates)
+        ctx.clear_state()
+        ctx.update_data(is_admin_choice=is_admin_choice)
+        await ctx.answer("Тарифы обновлены.")
+        await _show_partner_group_rates(ctx, group_db_id, is_admin_choice)
 
     @app.command_prefix("partner_group_act.")
     async def partner_group_action(ctx: Ctx) -> None:
@@ -828,10 +1505,11 @@ def register_handlers(app: VKBotApp) -> None:
         poster_id = int(ctx.data["poster_id"])
         selected = _selected(ctx.data)
         values = ctx.data["select_group_values"]
+        selected_group_ids = [values[int(num) - 1] for num in sorted(selected, key=int)]
         async with PartnerGroups() as partner_groups:
-            for num in selected:
-                await partner_groups.add_posters(values[int(num) - 1], poster_id)
+            await partner_groups.replace_poster_groups(poster_id, selected_group_ids)
         await ctx.answer("Площадки обновлены.")
+        ctx.clear_state()
         await _show_poster(ctx, poster_id)
 
     @app.command("manage_ad_groups")
@@ -876,24 +1554,29 @@ def register_handlers(app: VKBotApp) -> None:
             ad_group = await ad_groups.get_by_db_id(ad_group_db_id)
         async with PartnerGroups() as partner_groups:
             groups = await partner_groups.get_all(status=None)
+            selected_groups = await partner_groups.get_by_ad_group_id(ad_group["group_id"])
         values = [group["group_id"] for group in groups]
+        selected_group_ids = {group["group_id"] for group in selected_groups}
+        selected_ids = {str(index + 1) for index, group in enumerate(groups) if group["group_id"] in selected_group_ids}
         text = ["Выберите партнерские площадки:"]
         for index, group in enumerate(groups, 1):
             text.append(f"{index}) {await ctx.api.group_title(group['group_id'])}")
-        ctx.update_data(select_group_values=values, selected=set(), select_confirm_cmd="confirm_ad_group_groups", select_back_cmd="open_ad_group", ad_group_db_id=ad_group_db_id, ad_group_vk_id=ad_group["group_id"])
-        await ctx.answer("\n".join(text), keyboard=kb.number_select_kb(len(values), set(), "confirm_ad_group_groups", "manage_ad_groups"))
+        ctx.update_data(select_group_values=values, selected=selected_ids, select_confirm_cmd="confirm_ad_group_groups", select_back_cmd="open_ad_group", ad_group_db_id=ad_group_db_id, ad_group_vk_id=ad_group["group_id"])
+        await ctx.answer("\n".join(text), keyboard=kb.number_select_kb(len(values), selected_ids, "confirm_ad_group_groups", "manage_ad_groups"))
 
     @app.command("confirm_ad_group_groups")
     async def confirm_ad_group_groups(ctx: Ctx) -> None:
         if not await _admin_required(ctx):
             return
+        ad_group_db_id = int(ctx.data["ad_group_db_id"])
         values = ctx.data["select_group_values"]
         selected = _selected(ctx.data)
+        selected_group_ids = [values[int(num) - 1] for num in sorted(selected, key=int)]
         async with PartnerGroups() as partner_groups:
-            for num in selected:
-                await partner_groups.add_need_groups(values[int(num) - 1], int(ctx.data["ad_group_vk_id"]))
+            await partner_groups.replace_need_groups(int(ctx.data["ad_group_vk_id"]), selected_group_ids)
         await ctx.answer("Площадки добавлены.")
-        await _show_ad_group(ctx, int(ctx.data["ad_group_db_id"]))
+        ctx.clear_state()
+        await _show_ad_group(ctx, ad_group_db_id)
 
     @app.command("manage_requests")
     async def manage_requests_admin(ctx: Ctx) -> None:
@@ -963,6 +1646,27 @@ def register_handlers(app: VKBotApp) -> None:
             return
         target = ctx.cmd.split(".")[-1]
         ctx.update_data(newsletter_type=target)
+        if target == "sub":
+            async with Users() as users:
+                subscribers = await users.get_users_by_status(UserStatus.NO_ROLE)
+            if not subscribers:
+                await ctx.answer("Подписчиков пока нет.", keyboard=kb.newsletter_type_kb())
+                return
+            items = []
+            for user in subscribers[:9]:
+                user_id = int(user["user_id"])
+                title = await ctx.api.get_user_name(user_id)
+                items.append({"id": user_id, "title": f"{title} ({user_id})"})
+            await ctx.answer("Выберите подписчика:", keyboard=kb.list_select_kb(items, "select_newsletter_user", "admin_newsletter"))
+            return
+        await ctx.answer("Напишите сообщение для рассылки:")
+        ctx.set_state("admin_newsletter_text")
+
+    @app.command("select_newsletter_user")
+    async def select_newsletter_user(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        ctx.update_data(newsletter_type="sub", newsletter_target_id=int(ctx.payload["item_id"]))
         await ctx.answer("Напишите сообщение для рассылки:")
         ctx.set_state("admin_newsletter_text")
 
@@ -975,6 +1679,8 @@ def register_handlers(app: VKBotApp) -> None:
         elif target == "subs":
             async with Users() as users:
                 target_ids = [user["user_id"] for user in await users.get_users_by_status(UserStatus.NO_ROLE)]
+        elif target == "sub":
+            target_ids = [int(ctx.data["newsletter_target_id"])]
         else:
             async with Users() as users:
                 target_ids = [user["user_id"] for user in await users.get_users_by_status(UserStatus.ADVERTISER)]
@@ -1001,24 +1707,53 @@ def register_handlers(app: VKBotApp) -> None:
     async def open_newsletter(ctx: Ctx) -> None:
         if not await _admin_required(ctx):
             return
-        nl_id = int(ctx.payload["item_id"])
-        async with Newsletters() as newsletters:
-            nls = await newsletters.get_all(is_sub=True)
-        nl = next((item for item in nls if item["id"] == nl_id), None)
-        if not nl:
-            await ctx.answer("Рассылка не найдена.")
+        await _show_newsletter(ctx, int(ctx.payload["item_id"]))
+
+    @app.command("newsletter_change_time")
+    async def newsletter_change_time(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
             return
-        await ctx.answer(
-            f"Рассылка #{nl['id']}\nАвтор: {nl['creator_id']}\nДо: {nl['expires_at']}\n\n{nl['text']}",
-            keyboard=kb.keyboard(
-                [
-                    [kb.text_button("Принять", "newsletter_act.apply", "positive", nl_id=nl_id)],
-                    [kb.text_button("Отклонить", "newsletter_act.delete", "negative", nl_id=nl_id)],
-                    [kb.text_button("Назад", "newsletter_moderation", "negative")],
-                ]
-            ),
-            attachment=nl["file_id"],
-        )
+        ctx.update_data(edit_newsletter_id=int(ctx.payload["nl_id"]))
+        await ctx.answer("Введите новое время публикации по МСК в формате 18:00.")
+        ctx.set_state("newsletter_send_time")
+
+    @app.state_handler("newsletter_send_time")
+    async def newsletter_send_time(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        send_at = _parse_hh_mm(ctx.text)
+        if send_at is None:
+            await ctx.answer("Неверный формат времени. Пример: 18:00.")
+            return
+        nl_id = int(ctx.data["edit_newsletter_id"])
+        async with Newsletters() as newsletters:
+            await newsletters.update_send_time(nl_id, send_at)
+        ctx.clear_state()
+        await ctx.answer("Время публикации обновлено.")
+        await _show_newsletter(ctx, nl_id)
+
+    @app.command("newsletter_change_expires")
+    async def newsletter_change_expires(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        ctx.update_data(edit_newsletter_id=int(ctx.payload["nl_id"]))
+        await ctx.answer("Введите новую дату окончания в формате 20.05.2026.")
+        ctx.set_state("newsletter_expires_at")
+
+    @app.state_handler("newsletter_expires_at")
+    async def newsletter_expires_at(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        expires_at = _parse_dd_mm_yyyy(ctx.text)
+        if expires_at is None:
+            await ctx.answer("Неверный формат даты. Пример: 20.05.2026.")
+            return
+        nl_id = int(ctx.data["edit_newsletter_id"])
+        async with Newsletters() as newsletters:
+            await newsletters.update_expires_date(nl_id, expires_at)
+        ctx.clear_state()
+        await ctx.answer("Дата окончания обновлена.")
+        await _show_newsletter(ctx, nl_id)
 
     @app.command_prefix("newsletter_act.")
     async def newsletter_action(ctx: Ctx) -> None:
@@ -1026,8 +1761,11 @@ def register_handlers(app: VKBotApp) -> None:
             return
         nl_id = int(ctx.payload["nl_id"])
         if ctx.cmd.endswith("apply"):
-            await moderate_newsletter(nl_id, time(15, 0))
-            await ctx.answer("Рассылка принята. Время публикации: 15:00 МСК.", keyboard=kb.newsletter_type_kb())
+            async with Newsletters() as newsletters:
+                nl = await newsletters.get_by_id(nl_id)
+            send_at = (nl and nl["send_time"]) or time(15, 0)
+            await moderate_newsletter(nl_id, send_at)
+            await ctx.answer(f"Рассылка принята. Время публикации: {send_at.strftime('%H:%M')} МСК.", keyboard=kb.newsletter_type_kb())
         else:
             async with Newsletters() as newsletters:
                 await newsletters.delete(nl_id)
@@ -1037,7 +1775,105 @@ def register_handlers(app: VKBotApp) -> None:
     async def statistics(ctx: Ctx) -> None:
         if not await _admin_required(ctx):
             return
-        await ctx.answer(await texts.main_statistics_text(), keyboard=kb.back("menu_adminpanel"))
+        await ctx.answer(await texts.main_statistics_text(), keyboard=kb.statistics_menu())
+
+    @app.command("statistic.partners")
+    async def partner_statistics(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await _show_partner_statistics(ctx)
+
+    @app.command_prefix("change_partner.")
+    async def change_partner_statistics(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        cursor = int(ctx.data.get("partner_stats_cursor") or 0)
+        cursor += 1 if ctx.cmd.endswith(".next") else -1
+        await _show_partner_statistics(ctx, cursor)
+
+    @app.command("statistic.subscribes")
+    async def subscribes_statistics(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await ctx.answer(await texts.subs_statistics_text(ctx.api), keyboard=kb.back("statistics"))
+
+    @app.command("newsletter_statistics")
+    async def newsletter_statistics(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await ctx.answer("Статистика по рассылке", keyboard=kb.newsletter_statistics_kb())
+
+    @app.command("newsletter_statistics_admin")
+    async def newsletter_statistics_admin(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await _show_admin_newsletters_statistics(ctx)
+
+    @app.command_prefix("change_admin_nls_page.")
+    async def change_admin_newsletters_page(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        offset = int(ctx.data.get("admin_newsletters_offset") or 0)
+        offset += 5 if ctx.cmd.endswith(".next") else -5
+        await _show_admin_newsletters_statistics(ctx, offset)
+
+    @app.command("newsletter_statistics_advert")
+    async def newsletter_statistics_advert(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        await _show_advert_newsletter_statistics(ctx)
+
+    @app.command_prefix("change_advert_nl.")
+    async def change_advert_newsletter(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        cursor = int(ctx.data.get("advert_newsletter_cursor") or 0)
+        cursor += 1 if ctx.cmd.endswith(".next") else -1
+        await _show_advert_newsletter_statistics(ctx, cursor)
+
+    @app.command("delete_advert_nl")
+    async def delete_advert_newsletter(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        nl_id = ctx.data.get("advert_newsletter_id")
+        if not nl_id:
+            await ctx.answer("Сначала откройте рассылку.", keyboard=kb.back("newsletter_statistics"))
+            return
+        async with Newsletters() as newsletters:
+            await newsletters.delete(int(nl_id))
+        await ctx.answer("Рассылка удалена.")
+        await _show_advert_newsletter_statistics(ctx, int(ctx.data.get("advert_newsletter_cursor") or 0))
+
+    @app.command("moderate_advert_nl")
+    async def moderate_advert_newsletter(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        nl_id = ctx.data.get("advert_newsletter_id")
+        if not nl_id:
+            await ctx.answer("Сначала откройте рассылку.", keyboard=kb.back("newsletter_statistics"))
+            return
+        async with Newsletters() as newsletters:
+            nl = await newsletters.get_by_id(int(nl_id))
+        send_at = (nl and nl["send_time"]) or time(15, 0)
+        await moderate_newsletter(int(nl_id), send_at)
+        await ctx.answer(f"Рассылка принята. Время публикации: {send_at.strftime('%H:%M')} МСК.")
+        await _show_advert_newsletter_statistics(ctx, int(ctx.data.get("advert_newsletter_cursor") or 0))
+
+    @app.command_prefix("change_advert_nl_params.")
+    async def change_advert_newsletter_params(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        nl_id = ctx.data.get("advert_newsletter_id")
+        if not nl_id:
+            await ctx.answer("Сначала откройте рассылку.", keyboard=kb.back("newsletter_statistics"))
+            return
+        ctx.update_data(edit_newsletter_id=int(nl_id))
+        if ctx.cmd.endswith(".send_time"):
+            await ctx.answer("Введите новое время публикации по МСК в формате 18:00.")
+            ctx.set_state("newsletter_send_time")
+        else:
+            await ctx.answer("Введите новую дату окончания в формате 20.05.2026.")
+            ctx.set_state("newsletter_expires_at")
 
     @app.command("subs_stat_menu")
     async def subs_stat_menu(ctx: Ctx) -> None:
@@ -1045,7 +1881,7 @@ def register_handlers(app: VKBotApp) -> None:
             return
         async with UsersSubs() as subs:
             count = await subs.count()
-        await ctx.answer(f"Подтвержденных подписочных доступов: {count}", keyboard=kb.back("menu_adminpanel"))
+        await ctx.answer(f"Подтвержденных подписочных доступов: {count}", keyboard=kb.back("statistics"))
 
     @app.command("settings_plains")
     async def settings_plains(ctx: Ctx) -> None:
@@ -1099,5 +1935,6 @@ def register_handlers(app: VKBotApp) -> None:
             await ctx.answer("Значение должно быть числом.")
             return
         set_key(str(BASE_DIR / ".env"), ctx.data["env_var_name"], ctx.text)
+        environ[ctx.data["env_var_name"]] = ctx.text
         await ctx.answer("Параметр обновлен.\n\n" + texts.var_settings_text(), keyboard=kb.var_settings_kb(get_settings_var_names()))
         ctx.clear_state()

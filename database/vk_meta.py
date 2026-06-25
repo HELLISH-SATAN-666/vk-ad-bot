@@ -26,7 +26,10 @@ class VkGroups(Database):
                 screen_name = COALESCE(EXCLUDED.screen_name, vk_groups.screen_name),
                 token = COALESCE(EXCLUDED.token, vk_groups.token),
                 target_type = COALESCE(EXCLUDED.target_type, vk_groups.target_type),
-                can_wall_post = COALESCE(EXCLUDED.can_wall_post, vk_groups.can_wall_post);
+                can_wall_post = CASE
+                    WHEN $6::boolean IS NULL THEN vk_groups.can_wall_post
+                    ELSE EXCLUDED.can_wall_post
+                END;
             """,
             group_id,
             title,
@@ -38,6 +41,19 @@ class VkGroups(Database):
 
     async def get(self, group_id: int) -> Optional[Record]:
         return await self.fetchrow("SELECT * FROM vk_groups WHERE group_id = $1;", group_id)
+
+    async def get_partner_long_poll_groups(self, statuses: list[int]) -> list[Record]:
+        return await self.fetch(
+            """
+            SELECT DISTINCT vg.group_id, vg.token, vg.title, vg.screen_name
+            FROM vk_groups vg
+            JOIN partner_groups pg ON abs(pg.group_id) = vg.group_id
+            WHERE COALESCE(NULLIF(vg.token, ''), '') <> ''
+              AND vg.target_type = 'community'
+              AND pg.partner_type = ANY($1::smallint[]);
+            """,
+            statuses,
+        )
 
     async def delete(self, group_id: int) -> None:
         await self.execute("DELETE FROM vk_groups WHERE group_id = $1;", group_id)

@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import sys
-from datetime import timedelta
+from datetime import time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +30,15 @@ from database import (
     UserRequests,
     Users,
     UsersSubs,
+    VkGroups,
 )
 from database.base import close_pool
+from database.partner_groups import normalize_sub_rates
 from database.schema import ensure_schema
 from utils.config import BASE_DIR, get_ad_categories
-from utils.services import get_msk_now
+from utils.services import check_for_poster_events, get_msk_now
 from vkbot.api import VKGroupInfo
+from vkbot.api import normalize_group_ref
 from vkbot.app import VKBotApp
 from vkbot.handlers import register_handlers
 
@@ -46,6 +49,7 @@ class FakeVKApi:
         self.api_version = "5.199"
         self.sent: list[dict[str, Any]] = []
         self.groups: dict[int, VKGroupInfo] = {}
+        self.members: dict[tuple[int, int], bool] = {}
 
     async def send_message(self, peer_id: int, message: str, keyboard=None, attachment=None, disable_mentions=True):
         self.sent.append(
@@ -71,7 +75,10 @@ class FakeVKApi:
         return self.groups.get(abs(group_id), VKGroupInfo(abs(group_id), "", f"Group {abs(group_id)}")).name
 
     async def is_group_member(self, group_id: int, user_id: int) -> bool:
-        return True
+        return self.members.get((abs(int(group_id)), int(user_id)), True)
+
+    async def is_group_manager(self, user_id: int, group_id: int | None = None) -> bool:
+        return user_id == 1113916884
 
     async def wall_post(self, group_id: int, message: str, attachments=None, from_group=True):
         self.sent.append({"wall_group_id": group_id, "message": message, "attachment": attachments})
@@ -79,6 +86,12 @@ class FakeVKApi:
 
     async def delete_message(self, message_id: int, delete_for_all: bool = True):
         self.sent.append({"deleted_message_id": message_id, "delete_for_all": delete_for_all})
+
+    async def delete_wall_post(self, group_id: int, post_id: int):
+        self.sent.append({"deleted_wall_group_id": group_id, "deleted_wall_post_id": post_id})
+
+    async def get_user_name(self, user_id: int) -> str:
+        return f"User {user_id}"
 
 
 async def recreate_test_db() -> None:
@@ -130,6 +143,10 @@ async def manual_payment_count() -> int:
 
 
 async def main() -> None:
+    assert normalize_group_ref("https://vk.com/club123456?from=search") == "123456"
+    assert normalize_group_ref("m.vk.com/public987#wall") == "987"
+    assert normalize_group_ref("@screen_name") == "screen_name"
+
     load_dotenv(BASE_DIR / ".env", override=True)
     os.environ["DB_NAME"] = "vk_ad_bot_test"
     os.environ["ADMINS"] = "1113916884"
@@ -151,10 +168,27 @@ async def main() -> None:
     await send(app, partner_id, cmd="select_category", category_id="0")
     await send(app, partner_id, cmd="confirm_select_ad_categories")
 
+    await send(app, partner_id, cmd="add_bot_group")
+    await send(app, partner_id, "club3002 vk1.a.partner-token")
+    assert "Токен принят" in app.api.sent[-1]["message"]
+
     async with PartnerGroups() as partner_groups:
         groups = await partner_groups.get_all(creator_id=partner_id, status=None)
         assert len(groups) == 1
         partner_group_db_id = groups[0]["id"]
+    async with VkGroups() as vk_groups:
+        saved_group = await vk_groups.get(3002)
+        assert saved_group is not None
+        assert saved_group["token"] == "vk1.a.partner-token"
+    await send(app, partner_id, cmd="add_vk_group_token")
+    await send(app, partner_id, "club5001 token=need-token")
+    assert "Ключ сохранен" in app.api.sent[-1]["message"]
+    async with VkGroups() as vk_groups:
+        saved_need_group = await vk_groups.get(5001)
+        assert saved_need_group is not None
+        assert saved_need_group["token"] == "need-token"
+    async with PartnerGroups() as partner_groups:
+        assert await partner_groups.get_by_group_id(5001) is None
     async with Partners() as partners:
         assert await partners.in_db(partner_id)
 
@@ -164,6 +198,18 @@ async def main() -> None:
     await send(app, admin_id, cmd="manage_all_ads")
     await send(app, admin_id, cmd="manage_partner_groups_admin")
     await send(app, admin_id, cmd="partner_group_act.promotion_and_sub", group_id=partner_group_db_id)
+    await send(app, admin_id, cmd="partner_group_need_groups", group_id=partner_group_db_id)
+    await send(app, admin_id, "club6001")
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert 6001 in (group["need_groups"] or [])
+    await send(app, admin_id, cmd="partner_group_need_groups", group_id=partner_group_db_id)
+    await send(app, admin_id, "0")
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert not (group["need_groups"] or [])
+    await send(app, admin_id, cmd="partner_group_need_groups", group_id=partner_group_db_id)
+    await send(app, admin_id, "club6001")
     await send(app, admin_id, cmd="partner_group_schedule", group_id=partner_group_db_id)
 
     first_category = next(iter(get_ad_categories().values()))
@@ -198,9 +244,19 @@ async def main() -> None:
         group = await partner_groups.get_by_db_id(partner_group_db_id)
         assert poster_id in (group["show_ad_ids"] or [])
 
+    await send(app, admin_id, cmd="poster_select_groups", poster_id=poster_id)
+    await send(app, admin_id, cmd="select_group", num="1")
+    await send(app, admin_id, cmd="confirm_poster_groups")
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert poster_id not in (group["show_ad_ids"] or [])
+
     await send(app, admin_id, cmd="poster_act.activate", poster_id=poster_id)
     async with Posters() as posters:
         assert (await posters.get_by_id(poster_id))["status"] == PosterStatus.ACTIVE
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert poster_id in (group["show_ad_ids"] or [])
     await send(app, admin_id, cmd="poster_act.freeze", poster_id=poster_id)
     async with Posters() as posters:
         assert (await posters.get_by_id(poster_id))["status"] == PosterStatus.FROZEN
@@ -251,14 +307,84 @@ async def main() -> None:
         assert (await ad_groups.get_by_db_id(ad_group_db_id))["status"] == AdGroupsStatus.FROZEN
     await send(app, admin_id, cmd="ad_group_act.activate", ad_group_id=ad_group_db_id)
     await send(app, admin_id, cmd="ad_group_select_groups", ad_group_id=ad_group_db_id)
-    await send(app, admin_id, cmd="select_group", num="1")
     await send(app, admin_id, cmd="confirm_ad_group_groups")
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert 4001 in (group["need_groups"] or [])
+
+    wall_api = FakeVKApi()
+    wall_api.group_id = 3001
+    wall_api.groups = api.groups
+    blocked_wall_user_id = 222000006
+    wall_api.members[(4001, blocked_wall_user_id)] = False
+    await app.handle_update(
+        {
+            "type": "wall_post_new",
+            "group_id": 3001,
+            "object": {
+                "id": 77,
+                "owner_id": -3001,
+                "from_id": blocked_wall_user_id,
+                "text": "Пост без подписки",
+            },
+        },
+        api=wall_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    assert any(item.get("deleted_wall_group_id") == 3001 and item.get("deleted_wall_post_id") == 77 for item in wall_api.sent)
+    assert any(item.get("peer_id") == blocked_wall_user_id and "перед размещением" in item.get("message", "") for item in wall_api.sent)
+    async with UsersSubs() as subs:
+        assert not await subs.in_db(blocked_wall_user_id, 3001)
+
+    allowed_wall_user_id = 222000007
+    sent_before = len(wall_api.sent)
+    await app.handle_update(
+        {
+            "type": "wall_post_new",
+            "group_id": 3001,
+            "object": {
+                "id": 78,
+                "owner_id": -3001,
+                "from_id": allowed_wall_user_id,
+                "text": "Пост с подпиской",
+            },
+        },
+        api=wall_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    assert not any(item.get("deleted_wall_post_id") == 78 for item in wall_api.sent[sent_before:])
+    async with UsersSubs() as subs:
+        assert await subs.in_db(allowed_wall_user_id, 3001)
 
     subscriber_id = 222000003
     await send(app, subscriber_id, "start", ref="3001")
     await send(app, subscriber_id, cmd="check_subs", main_group_id=3001)
     async with UsersSubs() as subs:
         assert await subs.in_db(subscriber_id, 3001)
+
+    external_api = FakeVKApi()
+    external_api.group_id = 3001
+    external_api.groups = api.groups
+    external_subscriber_id = 222000005
+    await app.handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": external_subscriber_id,
+                    "peer_id": 2_000_004_001,
+                    "text": "Сообщение в чате партнерского сообщества",
+                    "attachments": [],
+                    "id": 9001,
+                    "conversation_message_id": 1,
+                }
+            },
+        },
+        api=external_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    async with UsersSubs() as subs:
+        assert await subs.in_db(external_subscriber_id, 3001)
 
     chat_peer_id = 2_000_003_001
     async with PartnerGroups() as partner_groups:
@@ -267,6 +393,121 @@ async def main() -> None:
     await send(app, subscriber_id, "chat message", peer_id=chat_peer_id)
     async with UsersSubs() as subs:
         assert await subs.in_db(subscriber_id, chat_peer_id)
+
+    await send(app, admin_id, cmd="ad_group_select_groups", ad_group_id=ad_group_db_id)
+    await send(app, admin_id, cmd="select_group", num="1")
+    await send(app, admin_id, cmd="confirm_ad_group_groups")
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert 4001 not in (group["need_groups"] or [])
+
+    await send(app, admin_id, cmd="partner_group_need_groups", group_id=partner_group_db_id)
+    await send(app, admin_id, "0")
+    await send(app, admin_id, cmd="partner_group_rates", group_id=partner_group_db_id)
+    await send(app, admin_id, cmd="partner_group_edit_rates", group_id=partner_group_db_id, rate_type="msg")
+    await send(app, admin_id, "2 30\n5 60")
+    await send(app, admin_id, cmd="partner_group_rate_type.msg", group_id=partner_group_db_id)
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert str(group["sub_rate_type"]).strip() == "msg"
+        assert normalize_sub_rates(group["sub_rates"])["msg"][0] == {"msg": 2, "price_rub": 30}
+
+    paid_msg_user_id = 222000008
+    await send(app, paid_msg_user_id, "start", ref="3001")
+    assert "Доступные тарифы" in app.api.sent[-1]["message"]
+    await send(app, paid_msg_user_id, cmd="buy_group_access", main_group_id=3001, rate_index=0)
+    await send(app, paid_msg_user_id, "Оплата доступа по сообщениям")
+    pay_id = await first_manual_payment_id()
+    await send(app, admin_id, cmd="manual_pay.apply", pay_id=pay_id)
+    async with UsersSubs() as subs:
+        sub = await subs.get_sub(paid_msg_user_id, 3001)
+        assert sub is not None
+        assert str(sub["type"]).strip() == "msg"
+        assert sub["msg_left"] == 2
+    async with Payments() as payments:
+        sub_access_pays = await payments.get_all(pay_type=PaymentTypes.SUB_ACCESS)
+        assert len(sub_access_pays) == 1
+
+    paid_msg_api = FakeVKApi()
+    paid_msg_api.group_id = 3001
+    paid_msg_api.groups = api.groups
+    for msg_id in (9101, 9102):
+        await app.handle_update(
+            {
+                "type": "message_new",
+                "object": {
+                    "message": {
+                        "from_id": paid_msg_user_id,
+                        "peer_id": 2_000_004_001,
+                        "text": "Оплаченное сообщение",
+                        "attachments": [],
+                        "id": msg_id,
+                        "conversation_message_id": msg_id,
+                    }
+                },
+            },
+            api=paid_msg_api,  # type: ignore[arg-type]
+            guard_only=True,
+        )
+    async with UsersSubs() as subs:
+        assert not await subs.in_db(paid_msg_user_id, 3001)
+
+    await app.handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": paid_msg_user_id,
+                    "peer_id": 2_000_004_001,
+                    "text": "Сообщение сверх лимита",
+                    "attachments": [],
+                    "id": 9103,
+                    "conversation_message_id": 9103,
+                }
+            },
+        },
+        api=paid_msg_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    assert any(item.get("deleted_message_id") == 9103 for item in paid_msg_api.sent)
+    assert any(item.get("peer_id") == 2_000_004_001 and "нужно купить доступ" in item.get("message", "") for item in paid_msg_api.sent)
+
+    await send(app, admin_id, cmd="partner_group_edit_rates", group_id=partner_group_db_id, rate_type="time")
+    await send(app, admin_id, "7 70")
+    await send(app, admin_id, cmd="partner_group_rate_type.time", group_id=partner_group_db_id)
+    paid_time_user_id = 222000009
+    await send(app, paid_time_user_id, "start", ref="3001")
+    await send(app, paid_time_user_id, cmd="buy_group_access", main_group_id=3001, rate_index=0)
+    await send(app, paid_time_user_id, "Оплата доступа по времени")
+    pay_id = await first_manual_payment_id()
+    await send(app, admin_id, cmd="manual_pay.apply", pay_id=pay_id)
+    async with UsersSubs() as subs:
+        sub = await subs.get_sub(paid_time_user_id, 3001)
+        assert sub is not None
+        assert str(sub["type"]).strip() == "time"
+        assert sub["expires_at"] > get_msk_now()
+
+    paid_time_api = FakeVKApi()
+    paid_time_api.group_id = 3001
+    paid_time_api.groups = api.groups
+    sent_before = len(paid_time_api.sent)
+    await app.handle_update(
+        {
+            "type": "wall_post_new",
+            "group_id": 3001,
+            "object": {
+                "id": 79,
+                "owner_id": -3001,
+                "from_id": paid_time_user_id,
+                "text": "Пост с оплаченным доступом по времени",
+            },
+        },
+        api=paid_time_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    assert not any(item.get("deleted_wall_post_id") == 79 for item in paid_time_api.sent[sent_before:])
+
+    await send(app, admin_id, cmd="partner_group_rate_type.none", group_id=partner_group_db_id)
 
     await send(app, advertiser_id, cmd="buy_ad.newsletter")
     await send(app, advertiser_id, "Тестовая рассылка")
@@ -281,10 +522,22 @@ async def main() -> None:
         assert len(nls) == 1
         nl_id = nls[0]["id"]
 
+    await send(app, admin_id, cmd="open_newsletter", item_id=nl_id)
+    await send(app, admin_id, cmd="newsletter_change_time", nl_id=nl_id)
+    await send(app, admin_id, "16:30")
+    await send(app, admin_id, cmd="newsletter_change_expires", nl_id=nl_id)
+    new_expires = (get_msk_now() + timedelta(days=3)).date()
+    await send(app, admin_id, new_expires.strftime("%d.%m.%Y"))
+    async with Newsletters() as newsletters:
+        nl = await newsletters.get_by_id(nl_id)
+        assert nl["send_time"] == time(16, 30)
+        assert nl["expires_at"] == new_expires
+
     await send(app, admin_id, cmd="newsletter_act.apply", nl_id=nl_id)
     async with Newsletters() as newsletters:
         nls = await newsletters.get_all(is_sub=True, is_moderating=False)
         assert len(nls) == 1
+        assert nls[0]["send_time"] == time(16, 30)
 
     await send(app, advertiser_id, cmd="buy_ad.newsletter")
     await send(app, advertiser_id, "Рассылка на удаление")
@@ -310,7 +563,32 @@ async def main() -> None:
         direct_nls = await newsletters.get_all()
         assert any(nl["target"] == NewslettersTarget.PARTNERS for nl in direct_nls)
 
+    await send(app, admin_id, cmd="admin_newsletter")
+    await send(app, admin_id, cmd="answer_newsletter_to.sub")
+    await send(app, admin_id, cmd="select_newsletter_user", item_id=subscriber_id)
+    await send(app, admin_id, "Личная рассылка подписчику")
+    assert any(
+        item.get("peer_id") == subscriber_id and item.get("message") == "Личная рассылка подписчику"
+        for item in api.sent
+    )
+    async with Newsletters() as newsletters:
+        direct_nls = await newsletters.get_all()
+        assert any(nl["target"] == NewslettersTarget.SUB for nl in direct_nls)
+
     await send(app, admin_id, cmd="statistics")
+    assert "newsletter_statistics" in (api.sent[-1].get("keyboard") or "")
+    await send(app, admin_id, cmd="statistic.partners")
+    assert "Рефералы" in api.sent[-1]["message"]
+    await send(app, admin_id, cmd="change_partner.next")
+    await send(app, admin_id, cmd="statistic.subscribes")
+    assert "Все подписчики" in api.sent[-1]["message"]
+    await send(app, admin_id, cmd="newsletter_statistics")
+    await send(app, admin_id, cmd="newsletter_statistics_admin")
+    assert "Все рассылки от администраторов" in api.sent[-1]["message"]
+    await send(app, admin_id, cmd="change_admin_nls_page.next")
+    await send(app, admin_id, cmd="newsletter_statistics_advert")
+    assert "Рассылка от рекламодателя" in api.sent[-1]["message"]
+    await send(app, admin_id, cmd="change_advert_nl.next")
     await send(app, admin_id, cmd="subs_stat_menu")
     await send(app, admin_id, cmd="settings_plains")
     await send(app, admin_id, cmd="admin_var_settings")
@@ -348,6 +626,13 @@ async def main() -> None:
     await send(app, partner_id, cmd="partner_group_act.delete", group_id=extra_group["id"])
     async with PartnerGroups() as partner_groups:
         assert await partner_groups.get_by_db_id(extra_group["id"]) is None
+
+    async with Queue() as queue:
+        await queue.add(get_msk_now() - timedelta(minutes=1), chat_peer_id, poster_id)
+    await check_for_poster_events(api)  # type: ignore[arg-type]
+    async with Queue() as queue:
+        assert not await queue.get_events(get_msk_now())
+    assert any(item.get("peer_id") == chat_peer_id and item.get("message") for item in api.sent)
 
     await send(app, admin_id, cmd="poster_act.delete", poster_id=poster_id)
     async with Posters() as posters:

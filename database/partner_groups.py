@@ -1,4 +1,6 @@
 from enum import IntEnum
+from json import dumps, loads
+from typing import Any
 
 from asyncpg import Record
 
@@ -13,6 +15,38 @@ class PartnerTypes(IntEnum):
     # В данной группе только показывается купленная реклама
     PROMOTION = 2
     PROMOTION_AND_SUB = 3
+
+
+DEFAULT_SUB_RATES = {
+    "msg": [
+        {"msg": 3, "price_rub": 20},
+        {"msg": 8, "price_rub": 40},
+        {"msg": 16, "price_rub": 120},
+        {"msg": 28, "price_rub": 180},
+        {"msg": 120, "price_rub": 500},
+    ],
+    "time": [
+        {"days": 7, "price_rub": 20},
+        {"days": 30, "price_rub": 50},
+        {"days": 90, "price_rub": 120},
+        {"days": 180, "price_rub": 200},
+        {"days": 365, "price_rub": 300},
+    ],
+    "none": [],
+}
+
+
+def normalize_sub_rates(raw: Any) -> dict[str, list[dict[str, int]]]:
+    if not raw:
+        return {key: list(value) for key, value in DEFAULT_SUB_RATES.items()}
+    rates = loads(raw) if isinstance(raw, str) else raw
+    result = {key: list(value) for key, value in DEFAULT_SUB_RATES.items()}
+    for key in ("msg", "time", "none"):
+        value = rates.get(key) if isinstance(rates, dict) else None
+        if isinstance(value, list):
+            result[key] = value
+    return result
+
 
 class PartnerGroups(Database):
     def __init__(self):
@@ -63,6 +97,113 @@ class PartnerGroups(Database):
             WHERE group_id = $2;
             """,
             ad_poster_ids, main_group_id
+        )
+
+    async def replace_poster_groups(self, poster_id: int, group_ids: list[int]) -> None:
+        await self.execute("""
+            UPDATE partner_groups
+            SET show_ad_ids = ARRAY(
+                SELECT x
+                FROM unnest(COALESCE(show_ad_ids, '{}')::integer[]) AS x
+                WHERE x <> $1
+            )
+            WHERE $1 = ANY(COALESCE(show_ad_ids, '{}')::integer[]);
+            """,
+            poster_id,
+        )
+        if not group_ids:
+            return
+
+        await self.execute("""
+            UPDATE partner_groups
+            SET show_ad_ids = (
+                SELECT ARRAY(
+                    SELECT DISTINCT x
+                    FROM unnest(COALESCE(show_ad_ids, '{}')::integer[] || ARRAY[$1]::integer[]) AS x
+                )
+            )
+            WHERE group_id = ANY($2::bigint[]);
+            """,
+            poster_id, group_ids,
+        )
+
+    async def replace_need_groups(self, ad_group_id: int, partner_group_ids: list[int]) -> None:
+        await self.execute("""
+            UPDATE partner_groups
+            SET need_groups = ARRAY(
+                SELECT x
+                FROM unnest(COALESCE(need_groups, '{}')::bigint[]) AS x
+                WHERE x <> $1
+            )
+            WHERE $1 = ANY(COALESCE(need_groups, '{}')::bigint[]);
+            """,
+            ad_group_id,
+        )
+        if not partner_group_ids:
+            return
+
+        await self.execute("""
+            UPDATE partner_groups
+            SET need_groups = (
+                SELECT ARRAY(
+                    SELECT DISTINCT x
+                    FROM unnest(COALESCE(need_groups, '{}')::bigint[] || ARRAY[$1]::bigint[]) AS x
+                )
+            )
+            WHERE group_id = ANY($2::bigint[]);
+            """,
+            ad_group_id, partner_group_ids,
+        )
+
+    async def replace_group_need_groups(self, main_group_id: int, need_group_ids: list[int]) -> None:
+        await self.execute(
+            """
+            UPDATE partner_groups
+            SET
+                need_groups = $1::bigint[],
+                partner_type = CASE
+                    WHEN cardinality($1::bigint[]) > 0 AND partner_type = $3 THEN $4
+                    ELSE partner_type
+                END
+            WHERE group_id = $2;
+            """,
+            need_group_ids,
+            main_group_id,
+            int(PartnerTypes.PROMOTION),
+            int(PartnerTypes.PROMOTION_AND_SUB),
+        )
+
+    async def change_sub_rate_type(self, main_group_id: int, rate_type: str) -> None:
+        if rate_type not in ("none", "time", "msg"):
+            raise ValueError(f"Unsupported subscription rate type: {rate_type}")
+        await self.execute(
+            """
+            UPDATE partner_groups
+            SET
+                sub_rate_type = $1,
+                partner_type = CASE
+                    WHEN $1 <> 'none' AND partner_type = $3 THEN $4
+                    ELSE partner_type
+                END
+            WHERE group_id = $2;
+            """,
+            rate_type,
+            main_group_id,
+            int(PartnerTypes.PROMOTION),
+            int(PartnerTypes.PROMOTION_AND_SUB),
+        )
+
+    async def replace_sub_rates(self, main_group_id: int, rate_type: str, rates: list[dict[str, int]]) -> None:
+        if rate_type not in ("time", "msg"):
+            raise ValueError(f"Unsupported subscription rate type: {rate_type}")
+        current = normalize_sub_rates(
+            await self.fetchval("SELECT sub_rates FROM partner_groups WHERE group_id = $1;", main_group_id)
+        )
+        current[rate_type] = rates
+        await self.execute(
+            "UPDATE partner_groups SET sub_rates = $1::jsonb WHERE group_id = $2;",
+            dumps(current, ensure_ascii=False),
+            main_group_id,
         )
 
     async def change_status(self, new_status: PartnerTypes, db_group_id: int = None, main_group_id: int = None):
@@ -118,13 +259,25 @@ class PartnerGroups(Database):
 
         active_need_group_ids = []
         for need_group_id in need_group_ids:
-            ad_group_id = await self.fetchval(
-                "SELECT group_id FROM ad_groups WHERE group_id = $1 AND status = $2",
+            linked_group_id = await self.fetchval(
+                """
+                SELECT $1::bigint
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM ad_groups
+                    WHERE group_id = $1 AND status = $2
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM vk_groups
+                    WHERE group_id = abs($1)
+                );
+                """,
                 need_group_id, int(AdGroupsStatus.ACTIVE)
             )
 
-            if ad_group_id is not None:
-                active_need_group_ids.append(ad_group_id)
+            if linked_group_id is not None:
+                active_need_group_ids.append(linked_group_id)
 
         return active_need_group_ids
 

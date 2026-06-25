@@ -10,6 +10,7 @@ class PaymentTypes(IntEnum):
     AD_GROUP = 0
     NEWSLETTER = 1
     POSTER = 2
+    SUB_ACCESS = 3
 
 
 class Payments(Database):

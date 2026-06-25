@@ -7,6 +7,7 @@ import random
 from dataclasses import dataclass
 from os import getenv
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -83,6 +84,7 @@ class VKApi:
             message_event=1,
             message_allow=1,
             message_deny=1,
+            wall_post_new=1,
         )
 
     async def send_message(
@@ -123,6 +125,9 @@ class VKApi:
     async def delete_message(self, message_id: int, delete_for_all: bool = True) -> None:
         await self.call("messages.delete", message_ids=message_id, delete_for_all=1 if delete_for_all else 0)
 
+    async def delete_wall_post(self, group_id: int, post_id: int) -> None:
+        await self.call("wall.delete", owner_id=-abs(int(group_id)), post_id=int(post_id))
+
     async def get_user_name(self, user_id: int) -> str:
         response = await self.call("users.get", user_ids=user_id)
         if not response:
@@ -162,6 +167,19 @@ class VKApi:
         if isinstance(response, dict):
             return bool(response.get("member"))
         return bool(response)
+
+    async def is_group_manager(self, user_id: int, group_id: Optional[int] = None) -> bool:
+        gid = group_id or self.group_id
+        if not gid:
+            return False
+        response = await self.call("groups.getMembers", group_id=abs(int(gid)), filter="managers")
+        items = response.get("items", []) if isinstance(response, dict) else []
+        for item in items:
+            if isinstance(item, dict) and int(item.get("id") or 0) == int(user_id):
+                return True
+            if not isinstance(item, dict) and int(item) == int(user_id):
+                return True
+        return False
 
     async def wall_post(
         self,
@@ -234,7 +252,11 @@ class VKLongPoll:
 def normalize_group_ref(raw: str) -> str:
     value = raw.strip()
     value = value.split()[0]
-    value = value.replace("https://vk.com/", "").replace("http://vk.com/", "").replace("vk.com/", "")
+    parsed = urlparse(value if "://" in value else f"https://{value}" if value.startswith(("vk.com/", "m.vk.com/")) else "")
+    if parsed.netloc in {"vk.com", "www.vk.com", "m.vk.com"}:
+        value = parsed.path
+    value = value.replace("https://vk.com/", "").replace("http://vk.com/", "").replace("vk.com/", "").replace("m.vk.com/", "")
+    value = value.split("?", 1)[0].split("#", 1)[0]
     value = value.strip("/")
     if value.startswith("@"):
         value = value[1:]

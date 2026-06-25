@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS partner_groups (
     group_id BIGINT NOT NULL,
     show_ad_ids INTEGER[] DEFAULT '{}',
     need_groups BIGINT[] DEFAULT '{}',
+    sub_rate_type TEXT DEFAULT 'none' NOT NULL,
+    sub_rates JSONB DEFAULT '{"msg":[{"msg":3,"price_rub":20},{"msg":8,"price_rub":40},{"msg":16,"price_rub":120},{"msg":28,"price_rub":180},{"msg":120,"price_rub":500}],"time":[{"days":7,"price_rub":20},{"days":30,"price_rub":50},{"days":90,"price_rub":120},{"days":180,"price_rub":200},{"days":365,"price_rub":300}],"none":[]}'::jsonb NOT NULL,
     partner_type SMALLINT DEFAULT 1,
     creator_id BIGINT,
     region_codes SMALLINT[],
@@ -119,6 +121,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_user_id_uidx ON users(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS partners_user_id_uidx ON partners(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS partner_groups_group_id_uidx ON partner_groups(group_id);
 CREATE UNIQUE INDEX IF NOT EXISTS users_subs_info_user_group_uidx ON users_subs_info(user_id, group_id);
+
+ALTER TABLE partner_groups
+ADD COLUMN IF NOT EXISTS sub_rate_type TEXT DEFAULT 'none' NOT NULL;
+
+ALTER TABLE partner_groups
+ADD COLUMN IF NOT EXISTS sub_rates JSONB DEFAULT '{"msg":[{"msg":3,"price_rub":20},{"msg":8,"price_rub":40},{"msg":16,"price_rub":120},{"msg":28,"price_rub":180},{"msg":120,"price_rub":500}],"time":[{"days":7,"price_rub":20},{"days":30,"price_rub":50},{"days":90,"price_rub":120},{"days":180,"price_rub":200},{"days":365,"price_rub":300}],"none":[]}'::jsonb NOT NULL;
+
+UPDATE partner_groups
+SET sub_rate_type = 'none'
+WHERE sub_rate_type IS NULL OR btrim(sub_rate_type) = '';
 """
 
 

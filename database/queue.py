@@ -33,11 +33,22 @@ class Queue(Database):
             current_time = self.now_msk.replace(second=0, microsecond=0)
 
         events = await self.fetch(
-            "SELECT * FROM queue WHERE activate_time = $1;",
+            "SELECT * FROM queue WHERE activate_time <= $1 ORDER BY activate_time, id;",
             current_time
         )
 
         return events
+
+    async def delete(self, event_ids: int | list[int]) -> None:
+        if isinstance(event_ids, int):
+            event_ids = [event_ids]
+        if not event_ids:
+            return
+
+        await self.execute(
+            "DELETE FROM queue WHERE id = ANY($1::integer[]);",
+            event_ids,
+        )
 
     async def get_group_events(self, group_id: int):
         events = await self.fetch(

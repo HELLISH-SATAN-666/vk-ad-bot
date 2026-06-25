@@ -99,6 +99,7 @@ def partner_menu() -> str:
     return keyboard(
         [
             [text_button("Добавить площадку", "add_bot_group", "primary")],
+            [text_button("Сохранить ключ", "add_vk_group_token", "primary")],
             [text_button("Профиль", "partner_profile")],
             [text_button("Назад", "main_menu", "negative")],
         ]
@@ -140,6 +141,75 @@ def admin_ad_manage() -> str:
             [text_button("Назад", "menu_adminpanel", "negative")],
         ]
     )
+
+
+def statistics_menu() -> str:
+    return keyboard(
+        [
+            [text_button("Рассылки", "newsletter_statistics", "primary")],
+            [text_button("Админ группы", "subs_stat_menu")],
+            [text_button("Партнеры", "statistic.partners")],
+            [text_button("Подписчики", "statistic.subscribes")],
+            [text_button("Назад", "menu_adminpanel", "negative")],
+        ]
+    )
+
+
+def partner_stats_kb(total: int, cursor: int) -> str:
+    rows = []
+    arrows = []
+    if cursor > 0:
+        arrows.append(text_button("<<", "change_partner.prev"))
+    if cursor + 1 < total:
+        arrows.append(text_button(">>", "change_partner.next"))
+    if arrows:
+        rows.append(arrows)
+    rows.append([text_button("Назад", "statistics", "negative")])
+    return keyboard(rows)
+
+
+def newsletter_statistics_kb() -> str:
+    return keyboard(
+        [
+            [text_button("Рассылка рекламодателей", "newsletter_statistics_advert", "primary")],
+            [text_button("Рассылка админа", "newsletter_statistics_admin")],
+            [text_button("Назад", "statistics", "negative")],
+        ]
+    )
+
+
+def admin_newsletters_page_kb(total: int, offset: int, page_size: int = 5) -> str:
+    rows = []
+    arrows = []
+    if offset > 0:
+        arrows.append(text_button("<<", "change_admin_nls_page.prev"))
+    if offset + page_size < total:
+        arrows.append(text_button(">>", "change_admin_nls_page.next"))
+    if arrows:
+        rows.append(arrows)
+    rows.append([text_button("Назад", "newsletter_statistics", "negative")])
+    return keyboard(rows)
+
+
+def advert_newsletter_kb(total: int, cursor: int, is_moderating: bool) -> str:
+    rows = []
+    if is_moderating:
+        rows.append([text_button("Принять", "moderate_advert_nl", "positive")])
+        rows.append([text_button("Отклонить", "delete_advert_nl", "negative")])
+    else:
+        rows.append([text_button("Время публикации", "change_advert_nl_params.send_time")])
+        rows.append([text_button("Дата окончания", "change_advert_nl_params.expires_at")])
+        rows.append([text_button("Удалить", "delete_advert_nl", "negative")])
+
+    arrows = []
+    if cursor > 0:
+        arrows.append(text_button("<<", "change_advert_nl.prev"))
+    if cursor + 1 < total:
+        arrows.append(text_button(">>", "change_advert_nl.next"))
+    if arrows:
+        rows.append(arrows)
+    rows.append([text_button("Назад", "newsletter_statistics", "negative")])
+    return keyboard(rows)
 
 
 def categories_kb(categories: dict[str, str], selected: set[str]) -> str:
@@ -217,7 +287,11 @@ def manage_partner_group_kb(group_id: int, status: int, is_admin: bool = False) 
     ])
     rows.append([text_button("Реклама и подписки", "partner_group_act.promotion_and_sub", "primary", group_id=group_id)])
     rows.append([
+        text_button("Группы подписки", "partner_group_need_groups", "primary", group_id=group_id),
+        text_button("Тарифы доступа", "partner_group_rates", "primary", group_id=group_id),
         text_button("Расписание", "partner_group_schedule", group_id=group_id),
+    ])
+    rows.append([
         text_button("Удалить", "partner_group_act.delete", "negative", group_id=group_id),
     ])
     rows.append([text_button("Назад", "manage_partner_groups_admin" if is_admin else "manage_partner_groups", "negative")])
@@ -296,6 +370,7 @@ def newsletter_type_kb() -> str:
             [text_button("Партнерам", "answer_newsletter_to.partners")],
             [text_button("Подписчикам", "answer_newsletter_to.subs")],
             [text_button("Рекламодателям", "answer_newsletter_to.advertisers")],
+            [text_button("Подписчику", "answer_newsletter_to.sub")],
             [text_button("Модерация рассылок", "newsletter_moderation", "primary")],
             [text_button("Назад", "menu_adminpanel", "negative")],
         ]

@@ -41,6 +41,12 @@ class Newsletters(Database):
 
         return group_info
 
+    async def get_by_id(self, nl_id: int) -> Optional[Record]:
+        return await self.fetchrow(
+            "SELECT * FROM newsletters WHERE id = $1;",
+            nl_id,
+        )
+
     async def get_current_sub_nls(self):
         now = self.now_msk.time().replace(second=0, microsecond=0)
         group_info = await self.fetch(
