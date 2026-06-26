@@ -71,15 +71,23 @@ class PartnerGroups(Database):
             group_ids = [group_ids]
         await self.execute("""
             UPDATE partner_groups
-            SET need_groups = (
-                SELECT ARRAY(
-                    SELECT DISTINCT x
-                    FROM unnest(need_groups || $1::bigint[]) AS x
-                )
-            )
+            SET
+                need_groups = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT x
+                        FROM unnest(COALESCE(need_groups, '{}')::bigint[] || $1::bigint[]) AS x
+                    )
+                ),
+                partner_type = CASE
+                    WHEN partner_type = $3 THEN $4
+                    ELSE partner_type
+                END
             WHERE group_id = $2;
             """,
-            group_ids, main_group_id
+            group_ids,
+            main_group_id,
+            int(PartnerTypes.PROMOTION),
+            int(PartnerTypes.PROMOTION_AND_SUB),
         )
 
     async def add_posters(self, main_group_id: int, ad_poster_ids: list[int] | int):

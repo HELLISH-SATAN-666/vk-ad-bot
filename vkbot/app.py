@@ -52,6 +52,10 @@ class Ctx:
         return int(self.message["peer_id"])
 
     @property
+    def is_chat(self) -> bool:
+        return self.peer_id > 2_000_000_000
+
+    @property
     def text(self) -> str:
         return (self.message.get("text") or "").strip()
 
@@ -74,6 +78,9 @@ class Ctx:
     async def answer(self, text: str, keyboard: Optional[str] = None, attachment: Optional[str] = None) -> int:
         return await self.api.send_message(self.peer_id, text, keyboard=keyboard, attachment=attachment)
 
+    async def answer_private(self, text: str, keyboard: Optional[str] = None, attachment: Optional[str] = None) -> int:
+        return await self.api.send_message(self.user_id, text, keyboard=keyboard, attachment=attachment)
+
     def set_state(self, state: Optional[str]) -> None:
         self.state.set_state(self.user_id, state)
 
@@ -89,7 +96,6 @@ class Ctx:
 
 
 Handler = Callable[[Ctx], Any]
-WallPostHandler = Callable[[VKApi, dict[str, Any]], Any]
 
 
 TEXT_COMMAND_ALIASES = {
@@ -103,8 +109,6 @@ TEXT_COMMAND_ALIASES = {
     "доступ по подписке": "buy_ad.group",
     "рассылка": "buy_ad.newsletter",
     "добавить площадку": "add_bot_group",
-    "сохранить ключ": "add_vk_group_token",
-    "добавить ключ": "add_vk_group_token",
     "профиль": "partner_profile",
     "вывод средств": "money_requests",
     "управление площадками": "manage_partner_groups",
@@ -142,7 +146,6 @@ class VKBotApp:
         self.prefix_handlers: list[tuple[str, Handler]] = []
         self.state_handlers: dict[str, Handler] = {}
         self.default_handler: Optional[Handler] = None
-        self.wall_post_handler: Optional[WallPostHandler] = None
 
     def command(self, cmd: str):
         def decorator(func: Handler):
@@ -169,25 +172,18 @@ class VKBotApp:
         self.default_handler = func
         return func
 
-    def wall_post(self, func: WallPostHandler):
-        self.wall_post_handler = func
-        return func
-
     async def handle_update(self, update: dict[str, Any], api: Optional[VKApi] = None, guard_only: bool = False) -> None:
         active_api = api or self.api
         if update.get("type") == "wall_post_new":
-            if self.wall_post_handler:
-                await self.wall_post_handler(active_api, update)
             return
         if update.get("type") != "message_new":
             return
         message = update.get("object", {}).get("message") or update.get("object") or {}
         if not message or message.get("out"):
             return
-        if guard_only and int(message.get("peer_id") or 0) <= 2_000_000_000:
-            return
-
         ctx = Ctx(api=active_api, state=self.state, update=update, message=message)
+        if guard_only and not ctx.is_chat:
+            return
         if not await is_new_message(active_api, message):
             logger.info(
                 "Skipping duplicate VK message peer_id=%s conversation_message_id=%s",
@@ -201,11 +197,26 @@ class VKBotApp:
         logger.info("Incoming VK message peer_id=%s user_id=%s text=%r cmd=%r", ctx.peer_id, ctx.user_id, ctx.text, cmd)
 
         try:
-            if guard_only:
+            if ctx.is_chat:
+                if text == "/id":
+                    await ctx.answer_private(f"VK peer_id этой беседы: {ctx.peer_id}\nVK user_id: {ctx.user_id}")
+                    try:
+                        await ctx.api.delete_message(
+                            int(ctx.message.get("id") or 0),
+                            delete_for_all=True,
+                            peer_id=ctx.peer_id,
+                            conversation_message_id=int(ctx.message.get("conversation_message_id") or 0) or None,
+                        )
+                    except Exception:
+                        logger.exception("Failed to delete /id command in VK chat peer_id=%s", ctx.peer_id)
+                    return
                 if cmd == "check_subs":
                     await self.command_handlers["check_subs"](ctx)
-                elif not cmd and self.default_handler:
+                elif self.default_handler:
                     await self.default_handler(ctx)
+                return
+
+            if guard_only:
                 return
 
             if cmd == "start" or text in {"/start", "start", "начать"}:

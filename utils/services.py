@@ -83,7 +83,24 @@ async def get_suitable_groups(poster) -> dict[str, list]:
     async with PartnerGroups() as partner_groups:
         selected = await partner_groups.get_by_poster_id(poster["id"])
         suitable = await partner_groups.get_by_poster_info(poster)
+    async with VkGroups() as vk_groups:
+        selected = await _filter_wall_postable_groups(vk_groups, selected)
+        suitable = await _filter_wall_postable_groups(vk_groups, suitable)
     return {"suitable_groups": suitable, "selected_groups": selected}
+
+
+async def _filter_wall_postable_groups(vk_groups: VkGroups, groups: list) -> list:
+    result = []
+    for group in groups:
+        meta = await vk_groups.get(abs(int(group["group_id"])))
+        if (
+            meta
+            and meta["target_type"] == "community"
+            and meta["can_wall_post"]
+            and meta["token"]
+        ):
+            result.append(group)
+    return result
 
 
 async def write_poster_content(advertiser_id: int, period: int, region_codes: list[int], poster_info: dict) -> None:
@@ -123,17 +140,6 @@ async def send_log(api: VKApi, text: str, keyboard: Optional[str] = None, attach
             logger.exception("Failed to send admin log to %s", peer_id)
 
 
-async def _api_for_group(main_api: VKApi, group_id: int) -> Optional[VKApi]:
-    if main_api.group_id and abs(group_id) == abs(main_api.group_id):
-        return main_api
-    async with VkGroups() as vk_groups:
-        meta = await vk_groups.get(abs(group_id))
-    token = meta and meta["token"]
-    if not token:
-        return None
-    return VKApi(token, group_id=abs(group_id), api_version=main_api.api_version)
-
-
 async def send_poster_to_group(api: VKApi, group_id: int, poster, text: Optional[str] = None) -> bool:
     text = text if text is not None else poster["text"]
     attachment = poster["file_id"]
@@ -149,21 +155,31 @@ async def send_poster_to_group(api: VKApi, group_id: int, poster, text: Optional
             logger.exception("Failed to send poster to VK chat %s", group_id)
             return False
 
-    group_api = await _api_for_group(api, group_id)
-    if not group_api:
-        logger.warning("No VK token for partner group %s; wall post skipped", group_id)
+    async with VkGroups() as vk_groups:
+        meta = await vk_groups.get(abs(int(group_id)))
+    token = meta and meta["token"]
+    if not token:
+        logger.warning("No VK token for community %s; wall post %s skipped", group_id, poster["id"])
         return False
-    should_close = group_api is not api
+
+    if not isinstance(api, VKApi) and hasattr(api, "wall_post"):
+        try:
+            await api.wall_post(group_id, wall_text, attachments=attachment)
+            return True
+        except Exception:
+            logger.exception("Failed to post poster %s to fake/test VK wall community=%s", poster["id"], group_id)
+            return False
+
+    group_api = VKApi(token, group_id=abs(int(group_id)), api_version=api.api_version)
     try:
         post_id = await group_api.wall_post(group_id, wall_text, attachments=attachment)
-        logger.info("Posted poster %s to VK wall %s as post %s", poster["id"], group_id, post_id)
+        logger.info("Posted poster %s to VK wall community=%s post_id=%s", poster["id"], group_id, post_id)
         return True
     except Exception:
-        logger.exception("Failed to post poster to VK wall %s", group_id)
+        logger.exception("Failed to post poster %s to VK wall community=%s", poster["id"], group_id)
         return False
     finally:
-        if should_close:
-            await group_api.close()
+        await group_api.close()
 
 
 async def send_poster_to_user(api: VKApi, user_id: int, poster, text: Optional[str] = None, keyboard: Optional[str] = None) -> bool:
@@ -189,12 +205,12 @@ async def send_newsletter(
             await newsletters.add(creator_id, text, NewslettersTarget[target.upper()])
 
     success = 0
-    for user_id in target_ids:
+    for peer_id in target_ids:
         try:
-            await api.send_message(user_id, text, attachment=attachment)
+            await api.send_message(peer_id, text, attachment=attachment)
             success += 1
         except Exception:
-            logger.exception("Failed to send newsletter to user %s", user_id)
+            logger.exception("Failed to send newsletter to peer %s", peer_id)
     return success
 
 
@@ -227,12 +243,19 @@ async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
             ad_group_id = int(payment_state["ad_group_id"])
             selected_group_ids = list(map(int, payment_state.get("selected_group_ids") or []))
             await write_ad_group_content(from_user, period, ad_group_id)
+            async with VkGroups() as vk_groups:
+                await vk_groups.upsert(
+                    ad_group_id,
+                    title=payment_state.get("ad_group_title"),
+                    screen_name=payment_state.get("ad_group_screen_name"),
+                    target_type="chat",
+                )
             if selected_group_ids:
                 async with PartnerGroups() as partner_groups:
                     for partner_group_id in selected_group_ids:
                         await partner_groups.add_need_groups(partner_group_id, ad_group_id)
             pay_type = PaymentTypes.AD_GROUP
-            await api.send_message(from_user, "Оплата подтверждена. Группа добавлена в подписочные связки.", keyboard=kb.advertiser_menu())
+            await api.send_message(from_user, "Оплата подтверждена. Беседа добавлена в подписочные условия выбранных площадок.", keyboard=kb.advertiser_menu())
 
         case "newsletter":
             target = NewslettersTarget[payment_state["newsletter_target"].upper()]

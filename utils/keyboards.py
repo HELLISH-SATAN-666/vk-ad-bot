@@ -99,7 +99,6 @@ def partner_menu() -> str:
     return keyboard(
         [
             [text_button("Добавить площадку", "add_bot_group", "primary")],
-            [text_button("Сохранить ключ", "add_vk_group_token", "primary")],
             [text_button("Профиль", "partner_profile")],
             [text_button("Назад", "main_menu", "negative")],
         ]
@@ -382,7 +381,16 @@ def open_bot_link(bot_group_id: int, ref_group_id: int, label: str = "Купит
     return keyboard([[link_button(label, link)]])
 
 
-def subscription_check_kb(groups: list[tuple[int, str]], main_group_id: int) -> str:
-    rows = [[link_button(name[:40], f"https://vk.com/club{abs(group_id)}")] for group_id, name in groups[:5]]
+def subscription_check_kb(groups: list[tuple], main_group_id: int) -> str:
+    rows = []
+    for group in groups[:5]:
+        group_id, name = int(group[0]), str(group[1])
+        link = group[2] if len(group) > 2 else None
+        if not link:
+            if group_id > 2_000_000_000:
+                link = f"https://vk.com/im?sel=c{group_id - 2_000_000_000}"
+            else:
+                link = f"https://vk.com/club{abs(group_id)}"
+        rows.append([link_button(name[:40], link)])
     rows.append([text_button("Проверить подписку", "check_subs", "positive", main_group_id=main_group_id)])
     return keyboard(rows)

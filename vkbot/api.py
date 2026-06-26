@@ -84,7 +84,7 @@ class VKApi:
             message_event=1,
             message_allow=1,
             message_deny=1,
-            wall_post_new=1,
+            wall_post_new=0,
         )
 
     async def send_message(
@@ -122,11 +122,43 @@ class VKApi:
             params["keyboard"] = keyboard
         await self.call("messages.edit", **params)
 
-    async def delete_message(self, message_id: int, delete_for_all: bool = True) -> None:
-        await self.call("messages.delete", message_ids=message_id, delete_for_all=1 if delete_for_all else 0)
+    async def delete_message(
+        self,
+        message_id: int,
+        delete_for_all: bool = True,
+        peer_id: Optional[int] = None,
+        conversation_message_id: Optional[int] = None,
+    ) -> None:
+        params = {"delete_for_all": 1 if delete_for_all else 0}
+        if peer_id and conversation_message_id:
+            params["peer_id"] = int(peer_id)
+            params["cmids"] = int(conversation_message_id)
+        else:
+            params["message_ids"] = int(message_id)
+        try:
+            await self.call("messages.delete", **params)
+        except VKApiError:
+            if peer_id and conversation_message_id and "cmids" in params:
+                params["conversation_message_ids"] = params.pop("cmids")
+                await self.call("messages.delete", **params)
+                return
+            raise
 
-    async def delete_wall_post(self, group_id: int, post_id: int) -> None:
-        await self.call("wall.delete", owner_id=-abs(int(group_id)), post_id=int(post_id))
+    async def wall_post(self, owner_id: int, message: str, attachments: Optional[str] = None, from_group: bool = True) -> int:
+        params: dict[str, Any] = {
+            "owner_id": -abs(int(owner_id)),
+            "message": message[:4096],
+            "from_group": 1 if from_group else 0,
+        }
+        if attachments:
+            params["attachments"] = attachments
+        response = await self.call("wall.post", **params)
+        if isinstance(response, dict):
+            return int(response.get("post_id") or 0)
+        return int(response or 0)
+
+    async def delete_wall_post(self, owner_id: int, post_id: int) -> None:
+        await self.call("wall.delete", owner_id=-abs(int(owner_id)), post_id=int(post_id))
 
     async def get_user_name(self, user_id: int) -> str:
         response = await self.call("users.get", user_ids=user_id)
@@ -154,6 +186,8 @@ class VKApi:
         return VKGroupInfo(id=int(group["id"]), screen_name=group.get("screen_name", ""), name=group.get("name", ""))
 
     async def group_title(self, group_id: int) -> str:
+        if is_vk_chat_peer_id(group_id):
+            return await self.chat_title(group_id)
         try:
             response = await self.call("groups.getById", group_ids=abs(int(group_id)), fields="screen_name")
             groups = response.get("groups") if isinstance(response, dict) else response
@@ -162,7 +196,50 @@ class VKApi:
         except Exception:
             return str(group_id)
 
+    async def chat_title(self, peer_id: int) -> str:
+        try:
+            response = await self.call("messages.getConversationsById", peer_ids=int(peer_id))
+            items = response.get("items", []) if isinstance(response, dict) else []
+            if not items:
+                return f"VK chat {peer_id}"
+            conversation = items[0].get("conversation") or items[0]
+            chat_settings = conversation.get("chat_settings") or {}
+            return chat_settings.get("title") or f"VK chat {peer_id}"
+        except Exception:
+            return f"VK chat {peer_id}"
+
+    async def is_chat_member(self, peer_id: int, user_id: int) -> bool:
+        response = await self.call("messages.getConversationMembers", peer_id=int(peer_id))
+        items = response.get("items", []) if isinstance(response, dict) else []
+        for item in items:
+            member_id = item.get("member_id") if isinstance(item, dict) else item
+            if int(member_id or 0) == int(user_id):
+                return True
+        return False
+
+    async def chat_invite_link(self, peer_id: int) -> Optional[str]:
+        response = await self.call("messages.getInviteLink", peer_id=int(peer_id))
+        if isinstance(response, dict):
+            return response.get("link")
+        if isinstance(response, str):
+            return response
+        return None
+
+    async def target_link(self, group_id: int) -> str:
+        if is_vk_chat_peer_id(group_id):
+            try:
+                link = await self.chat_invite_link(group_id)
+                if link:
+                    return link
+            except Exception:
+                logger.exception("Failed to get VK chat invite link for peer_id=%s", group_id)
+            chat_id = int(group_id) - 2_000_000_000
+            return f"https://vk.com/im?sel=c{chat_id}"
+        return f"https://vk.com/club{abs(int(group_id))}"
+
     async def is_group_member(self, group_id: int, user_id: int) -> bool:
+        if is_vk_chat_peer_id(group_id):
+            return await self.is_chat_member(group_id, user_id)
         response = await self.call("groups.isMember", group_id=abs(int(group_id)), user_id=user_id)
         if isinstance(response, dict):
             return bool(response.get("member"))
@@ -180,24 +257,6 @@ class VKApi:
             if not isinstance(item, dict) and int(item) == int(user_id):
                 return True
         return False
-
-    async def wall_post(
-        self,
-        group_id: int,
-        message: str,
-        attachments: Optional[str] = None,
-        from_group: bool = True,
-    ) -> int:
-        params = {
-            "owner_id": -abs(int(group_id)),
-            "from_group": 1 if from_group else 0,
-            "message": message[:16384],
-        }
-        if attachments:
-            params["attachments"] = attachments
-        response = await self.call("wall.post", **params)
-        return int(response["post_id"])
-
 
 class VKLongPoll:
     def __init__(self, api: VKApi, group_id: int):
@@ -267,6 +326,13 @@ def normalize_group_ref(raw: str) -> str:
     if value.startswith("event") and value[5:].isdigit():
         return value[5:]
     return value
+
+
+def is_vk_chat_peer_id(value: int | str) -> bool:
+    try:
+        return int(value) > 2_000_000_000
+    except (TypeError, ValueError):
+        return False
 
 
 def parse_payload(raw: Any) -> dict[str, Any]:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import asyncio
+import re
 from datetime import date, time, timedelta
 from os import environ, getenv
 from typing import Any
@@ -43,10 +45,11 @@ from utils.services import (
     send_newsletter,
 )
 from vkbot.app import Ctx, VKBotApp
-from vkbot.api import VKApi
+from vkbot.api import VKApi, is_vk_chat_peer_id
 
 
 logger = logging.getLogger(__name__)
+SUBSCRIPTION_PROMPT_TTL_SECONDS = 90
 
 
 def _is_config_admin(user_id: int) -> bool:
@@ -107,6 +110,9 @@ def _payment_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
         case "group":
             state["ad_group_id"] = data["ad_group_id"]
             state["selected_group_ids"] = list(map(int, data.get("selected_group_ids") or []))
+            state["ad_group_title"] = data.get("ad_group_title")
+            state["ad_group_screen_name"] = data.get("ad_group_screen_name")
+            state["ad_group_token"] = data.get("ad_group_token")
         case "newsletter":
             state["newsletter_text"] = data["newsletter_text"]
             state["newsletter_attachment"] = data.get("newsletter_attachment")
@@ -118,22 +124,6 @@ def _payment_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def _extract_group_and_token(text: str) -> tuple[str, str | None]:
-    text = text.strip()
-    marker = "token="
-    marker_pos = text.lower().find(marker)
-    if marker_pos != -1:
-        group_ref = text[:marker_pos].strip()
-        token_parts = text[marker_pos + len(marker) :].strip().split()
-        return group_ref, token_parts[0] if token_parts else None
-
-    parts = text.split()
-    if len(parts) == 2 and (parts[1].startswith("vk1.") or len(parts[1]) >= 40):
-        return parts[0], parts[1]
-
-    return text, None
-
-
 def _split_group_refs(text: str) -> list[str]:
     refs = []
     for part in text.replace("\n", " ").replace(",", " ").replace(";", " ").split():
@@ -141,6 +131,202 @@ def _split_group_refs(text: str) -> list[str]:
         if ref:
             refs.append(ref)
     return refs
+
+
+def _extract_group_and_token(text: str) -> tuple[str, str | None]:
+    text = text.strip()
+    marker = "token="
+    marker_pos = text.casefold().find(marker)
+    if marker_pos != -1:
+        group_ref = text[:marker_pos].strip()
+        token_parts = text[marker_pos + len(marker) :].strip().split()
+        return group_ref, token_parts[0] if token_parts else None
+
+    parts = text.split()
+    if len(parts) >= 2 and (parts[-1].startswith("vk1.") or len(parts[-1]) >= 40):
+        return " ".join(parts[:-1]).strip(), parts[-1]
+
+    return text, None
+
+
+def _parse_vk_chat_peer_id(raw: str) -> int | None:
+    text = raw.strip()
+    if not text:
+        return None
+
+    if "token=" in text.casefold() or "vk1." in text:
+        return None
+
+    match = re.search(r"(?<!\d)(2\d{9,})(?!\d)", text)
+    if match and is_vk_chat_peer_id(match.group(1)):
+        return int(match.group(1))
+
+    match = re.search(r"(?:^|\s)c(?:hat)?[_-]?(\d{1,9})(?:\s|$)", text.casefold())
+    if match:
+        return 2_000_000_000 + int(match.group(1))
+
+    return None
+
+
+def _is_bot_invite_action(ctx: Ctx) -> bool:
+    action = ctx.message.get("action") or {}
+    action_type = str(action.get("type") or "")
+    if action_type not in {"chat_invite_user", "chat_invite_user_by_link"}:
+        return False
+
+    raw_member_id = action.get("member_id")
+    if raw_member_id is None:
+        members = action.get("member_ids") or []
+        raw_member_id = members[0] if members else None
+    if raw_member_id is None:
+        return ctx.state.get_state(ctx.user_id) in {"buy_group", "partner_group_need_groups"}
+
+    try:
+        member_id = int(raw_member_id)
+    except (TypeError, ValueError):
+        return False
+    return bool(ctx.api.group_id) and abs(member_id) == abs(int(ctx.api.group_id))
+
+
+async def _save_chat_meta(ctx: Ctx, chat_peer_id: int) -> str:
+    group_name = await ctx.api.chat_title(chat_peer_id)
+    async with VkGroups() as vk_groups:
+        await vk_groups.upsert(chat_peer_id, title=group_name, screen_name="", target_type="chat")
+    return group_name
+
+
+async def _delete_message_later(api: VKApi, peer_id: int, message_id: int, delay: int = SUBSCRIPTION_PROMPT_TTL_SECONDS) -> None:
+    if not message_id:
+        return
+    await asyncio.sleep(delay)
+    try:
+        await api.delete_message(int(message_id), delete_for_all=True, peer_id=int(peer_id))
+    except Exception:
+        logger.exception("Failed to delete temporary VK bot message peer_id=%s message_id=%s", peer_id, message_id)
+
+
+def _schedule_temporary_delete(api: VKApi, peer_id: int, message_id: int) -> None:
+    if message_id:
+        asyncio.create_task(_delete_message_later(api, peer_id, message_id))
+
+
+async def _answer_private_safely(ctx: Ctx, text: str, keyboard: str | None = None, attachment: str | None = None) -> int:
+    try:
+        return await ctx.answer_private(text, keyboard=keyboard, attachment=attachment)
+    except Exception:
+        logger.exception("Failed to send private VK message to user=%s from chat peer_id=%s", ctx.user_id, ctx.peer_id)
+        return 0
+
+
+async def _answer_flow(ctx: Ctx, text: str, *, private: bool = False, keyboard: str | None = None, attachment: str | None = None) -> int:
+    if private:
+        return await _answer_private_safely(ctx, text, keyboard=keyboard, attachment=attachment)
+    return await ctx.answer(text, keyboard=keyboard, attachment=attachment)
+
+
+async def _show_buy_group_partner_selector(ctx: Ctx, chat_peer_id: int, group_name: str, *, private: bool = False) -> None:
+    ctx.update_data(
+        ad_group_id=chat_peer_id,
+        ad_group_title=group_name,
+        ad_group_screen_name="",
+        ad_group_token=None,
+    )
+    async with PartnerGroups() as partner_groups:
+        partner_group_ids = await partner_groups.get_all_ids()
+    if not partner_group_ids:
+        await _answer_flow(
+            ctx,
+            "Пока нет партнерских площадок для подписочной рекламы. Обратитесь к администратору.",
+            private=private,
+            keyboard=kb.advertiser_menu(),
+        )
+        ctx.clear_state()
+        return
+
+    titles = await _group_titles(ctx.api, partner_group_ids)
+    text = [texts.ADD_GROUP_SUCCESSFUL_TEXT, ""]
+    for index, group_id in enumerate(partner_group_ids, 1):
+        text.append(f"{index}) {titles[group_id]}")
+    ctx.update_data(
+        select_mode="buy_group",
+        select_group_values=partner_group_ids,
+        selected=set(),
+    )
+    await _answer_flow(
+        ctx,
+        "\n".join(text),
+        private=private,
+        keyboard=kb.number_select_kb(len(partner_group_ids), set(), "confirm_select_groups", "buy_ad"),
+    )
+    ctx.set_state(None)
+
+
+async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
+    if not ctx.is_chat or not _is_bot_invite_action(ctx):
+        return False
+
+    state = ctx.state.get_state(ctx.user_id)
+    chat_peer_id = ctx.peer_id
+    if not state:
+        await _answer_private_safely(
+            ctx,
+            "Бот добавлен в беседу. Если вы хотели привязать ее к площадке или подписочной рекламе, "
+            "начните нужный сценарий в личке с ботом и добавьте бота в беседу повторно.\n\n"
+            f"peer_id этой беседы: {chat_peer_id}",
+        )
+        return True
+
+    try:
+        group_name = await _save_chat_meta(ctx, chat_peer_id)
+        if False and state == "partner_group_id":
+            ctx.update_data(partner_group_id=chat_peer_id, partner_group_token=None)
+            ctx.set_state("partner_region")
+            await _answer_private_safely(ctx, f"Беседа найдена: {group_name}.\n\n{texts.SELECT_REGION_PARTNER_TEXT}")
+            return True
+
+        if state == "buy_group":
+            await _show_buy_group_partner_selector(ctx, chat_peer_id, group_name, private=True)
+            return True
+
+        if state == "partner_group_need_groups":
+            group_db_id = int(ctx.data.get("need_group_partner_db_id") or 0)
+            is_admin_choice = bool(ctx.data.get("need_group_is_admin_choice"))
+            if not group_db_id:
+                ctx.clear_state()
+                await _answer_private_safely(ctx, "Не нашел площадку для настройки. Откройте ее заново в личке.")
+                return True
+
+            async with PartnerGroups() as partner_groups:
+                group = await partner_groups.get_by_db_id(group_db_id)
+                if not group:
+                    ctx.clear_state()
+                    await _answer_private_safely(ctx, "Площадка не найдена.")
+                    return True
+                need_group_ids = [int(group_id) for group_id in (group["need_groups"] or [])]
+                if chat_peer_id not in need_group_ids:
+                    need_group_ids.append(chat_peer_id)
+                await partner_groups.replace_group_need_groups(int(group["group_id"]), need_group_ids)
+
+            ctx.clear_state()
+            ctx.update_data(is_admin_choice=is_admin_choice)
+            await _answer_private_safely(
+                ctx,
+                f"Беседа добавлена в условия подписки: {group_name}.\n"
+                f"Всего обязательных бесед: {len(need_group_ids)}.",
+                keyboard=kb.keyboard([[kb.text_button("Открыть площадку", "open_partner_group", "primary", item_id=group_db_id)]]),
+            )
+            return True
+
+        await _answer_private_safely(
+            ctx,
+            "Бот добавлен в беседу, но сейчас в личке нет сценария, который ждет VK-беседу.\n\n"
+            f"peer_id этой беседы: {chat_peer_id}",
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to complete VK chat binding user=%s peer_id=%s state=%s", ctx.user_id, chat_peer_id, state)
+        await _answer_private_safely(ctx, "Не смог привязать беседу. Проверьте, что бот добавлен в нее и попробуйте еще раз.")
+        return True
 
 
 def _sub_rate_type(group: dict | Any) -> str:
@@ -217,20 +403,38 @@ async def _ensure_user(ctx: Ctx) -> None:
             )
 
 
-async def _subscription_groups_for_api(api: VKApi, main_group_id: int) -> list[tuple[int, str]]:
+async def _subscription_groups_for_api(api: VKApi, main_group_id: int) -> list[tuple[int, str, str | None]]:
     async with PartnerGroups() as partner_groups:
         need_group_ids = await partner_groups.get_active_need_group_ids(main_group_id)
+        if not need_group_ids and is_vk_chat_peer_id(main_group_id):
+            async with AdGroups() as ad_groups:
+                active_ad_groups = await ad_groups.get_by_status(AdGroupsStatus.ACTIVE)
+            if any(int(group["group_id"]) == int(main_group_id) for group in active_ad_groups):
+                linked_partner_groups = await partner_groups.get_by_ad_group_id(main_group_id)
+                need_group_ids = [
+                    int(group["group_id"])
+                    for group in linked_partner_groups
+                    if int(group["partner_type"]) != int(PartnerTypes.FROZEN)
+                ]
     groups = []
     for group_id in need_group_ids:
-        groups.append((group_id, await api.group_title(group_id)))
+        link = None
+        try:
+            link = await api.target_link(group_id)
+        except Exception:
+            logger.exception("Failed to build VK target link for group=%s", group_id)
+        groups.append((group_id, await api.group_title(group_id), link))
     return groups
 
 
-async def _subscription_groups(ctx: Ctx, main_group_id: int) -> list[tuple[int, str]]:
+async def _subscription_groups(ctx: Ctx, main_group_id: int) -> list[tuple[int, str, str | None]]:
     return await _subscription_groups_for_api(ctx.api, main_group_id)
 
 
 async def _is_group_member_for_api(api: VKApi, group_id: int, user_id: int) -> bool:
+    if is_vk_chat_peer_id(group_id):
+        return await api.is_chat_member(group_id, user_id)
+
     async with VkGroups() as vk_groups:
         meta = await vk_groups.get(abs(int(group_id)))
     token = meta and meta["token"]
@@ -249,15 +453,15 @@ async def _is_group_member(ctx: Ctx, group_id: int, user_id: int) -> bool:
     return await _is_group_member_for_api(ctx.api, group_id, user_id)
 
 
-async def _missing_subscription_groups(api: VKApi, main_group_id: int, user_id: int) -> list[tuple[int, str]]:
+async def _missing_subscription_groups(api: VKApi, main_group_id: int, user_id: int) -> list[tuple[int, str, str | None]]:
     missing = []
-    for group_id, title in await _subscription_groups_for_api(api, main_group_id):
+    for group_id, title, link in await _subscription_groups_for_api(api, main_group_id):
         try:
             if not await _is_group_member_for_api(api, group_id, user_id):
-                missing.append((group_id, title))
+                missing.append((group_id, title, link))
         except Exception:
             logger.exception("Failed to check VK membership for user=%s group=%s", user_id, group_id)
-            missing.append((group_id, title))
+            missing.append((group_id, title, link))
     return missing
 
 
@@ -319,39 +523,65 @@ def _paid_access_kb(group: Any) -> str:
 async def _send_paid_access_prompt(ctx: Ctx, group: Any, reason: str = "not_paid") -> bool:
     if _sub_rate_type(group) not in ("time", "msg"):
         return False
-    await ctx.answer(_paid_access_text(group, reason), keyboard=_paid_access_kb(group))
+    text = _paid_access_text(group, reason)
+    if ctx.is_chat:
+        text = (
+            f"Привет {await _vk_user_mention(ctx.api, ctx.user_id)}. Рад видеть тебя в группе, "
+            "чтобы размещать объявления, необходимо зарегистрироваться через наш бот по кнопке\n\n"
+            + text
+        )
+    message_id = await ctx.answer(text, keyboard=_paid_access_kb(group))
+    if ctx.is_chat:
+        _schedule_temporary_delete(ctx.api, ctx.peer_id, message_id)
     return True
 
 
-async def _send_paid_access_prompt_to_user(api: VKApi, user_id: int, group: Any, reason: str = "not_paid") -> None:
-    await api.send_message(user_id, _paid_access_text(group, reason), keyboard=_paid_access_kb(group))
+async def _vk_user_mention(api: VKApi, user_id: int) -> str:
+    try:
+        name = await api.get_user_name(user_id)
+    except Exception:
+        logger.exception("Failed to get VK user name for mention user=%s", user_id)
+        name = "User"
+    return f"[id{int(user_id)}|{name or 'User'}]"
 
 
 async def _subscription_partner_group(ctx: Ctx):
     if ctx.peer_id <= 2_000_000_000:
         return None
 
-    candidates = [ctx.peer_id]
-    if ctx.api.group_id:
-        candidates.append(abs(int(ctx.api.group_id)))
-
     async with PartnerGroups() as partner_groups:
-        for group_id in dict.fromkeys(candidates):
-            partner_group = await partner_groups.get_by_group_id(group_id)
-            if partner_group and partner_group["partner_type"] in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
-                return partner_group
+        partner_group = await partner_groups.get_by_group_id(ctx.peer_id)
+        if partner_group and partner_group["partner_type"] in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
+            return partner_group
+
+        linked_partner_groups = await partner_groups.get_by_ad_group_id(ctx.peer_id)
+    if linked_partner_groups:
+        async with AdGroups() as ad_groups:
+            active_ad_groups = await ad_groups.get_by_status(AdGroupsStatus.ACTIVE)
+        if any(int(group["group_id"]) == int(ctx.peer_id) for group in active_ad_groups):
+            return {
+                "group_id": ctx.peer_id,
+                "partner_type": PartnerTypes.SUB_GROUPS,
+                "sub_rate_type": "none",
+            }
     return None
 
 
-async def _send_subscription_prompt(ctx: Ctx, main_group_id: int) -> bool:
+async def _send_subscription_prompt(ctx: Ctx, main_group_id: int, *, mode: str = "initial") -> bool:
     groups = await _subscription_groups(ctx, main_group_id)
     if not groups:
         return False
-    group_names = "\n".join(f"- {name}" for _, name in groups)
-    await ctx.answer(
-        "Для доступа необходимо подписаться на следующие VK-сообщества:\n\n" + group_names,
+    mention = await _vk_user_mention(ctx.api, ctx.user_id)
+    if mode == "resubscribe":
+        text = f"{mention}\nНеобходимо подписаться на группы и не отписываться"
+    else:
+        text = f"Привет {mention}. Для того чтобы написать сообщения, необходимо подписаться на следующие каналы"
+    message_id = await ctx.answer(
+        text,
         keyboard=kb.subscription_check_kb(groups, main_group_id),
     )
+    if ctx.is_chat:
+        _schedule_temporary_delete(ctx.api, ctx.peer_id, message_id)
     return True
 
 
@@ -372,7 +602,7 @@ async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
     missing = await _missing_subscription_groups(ctx.api, main_group_id, ctx.user_id)
 
     if missing:
-        await ctx.answer("Вы еще не подписаны на все нужные сообщества:\n\n" + "\n".join(f"- {name}" for _, name in missing))
+        await _send_subscription_prompt(ctx, main_group_id)
         return False
 
     async with UsersSubs() as subs:
@@ -391,9 +621,15 @@ async def _chat_guard(ctx: Ctx) -> bool:
     has_paid_access, paid_reason = await _paid_access_status(partner_group, ctx.user_id)
     if not has_paid_access:
         message_id = ctx.message.get("id")
-        if message_id:
+        conversation_message_id = ctx.message.get("conversation_message_id")
+        if message_id or conversation_message_id:
             try:
-                await ctx.api.delete_message(int(message_id), delete_for_all=True)
+                await ctx.api.delete_message(
+                    int(message_id or 0),
+                    delete_for_all=True,
+                    peer_id=ctx.peer_id,
+                    conversation_message_id=int(conversation_message_id or 0) or None,
+                )
             except Exception:
                 logger.exception("Failed to delete message %s in VK chat", message_id)
         await _send_paid_access_prompt(ctx, partner_group, paid_reason)
@@ -404,89 +640,29 @@ async def _chat_guard(ctx: Ctx) -> bool:
         await _consume_paid_message(partner_group, ctx.user_id)
         return True
 
+    async with UsersSubs() as subs:
+        existing_sub = await subs.get_sub(ctx.user_id, source_group_id)
     missing = await _missing_subscription_groups(ctx.api, source_group_id, ctx.user_id)
     if missing:
         message_id = ctx.message.get("id")
-        if message_id:
+        conversation_message_id = ctx.message.get("conversation_message_id")
+        if message_id or conversation_message_id:
             try:
-                await ctx.api.delete_message(int(message_id), delete_for_all=True)
+                await ctx.api.delete_message(
+                    int(message_id or 0),
+                    delete_for_all=True,
+                    peer_id=ctx.peer_id,
+                    conversation_message_id=int(conversation_message_id or 0) or None,
+                )
             except Exception:
                 logger.exception("Failed to delete message %s in VK chat", message_id)
-        await _send_subscription_prompt(ctx, source_group_id)
+        await _send_subscription_prompt(ctx, source_group_id, mode="resubscribe" if existing_sub else "initial")
         return False
 
     async with UsersSubs() as subs:
         await subs.add_sub(ctx.user_id, source_group_id, "sub_msg")
     await _consume_paid_message(partner_group, ctx.user_id)
     return True
-
-
-async def _wall_post_guard(api: VKApi, update: dict[str, Any]) -> None:
-    obj = update.get("object") or {}
-    owner_id = int(obj.get("owner_id") or 0)
-    source_group_id = abs(int(update.get("group_id") or 0))
-    if not source_group_id and owner_id < 0:
-        source_group_id = abs(owner_id)
-    if not source_group_id and api.group_id:
-        source_group_id = abs(int(api.group_id))
-
-    post_id = int(obj.get("id") or obj.get("post_id") or 0)
-    user_id = int(obj.get("from_id") or obj.get("signer_id") or obj.get("created_by") or 0)
-    if source_group_id <= 0 or post_id <= 0 or user_id <= 0:
-        return
-
-    try:
-        if await api.is_group_manager(user_id, source_group_id):
-            return
-    except Exception:
-        logger.exception("Failed to check wall author manager rights user=%s group=%s", user_id, source_group_id)
-
-    async with PartnerGroups() as partner_groups:
-        partner_group = await partner_groups.get_by_group_id(source_group_id)
-    if not partner_group or partner_group["partner_type"] not in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
-        return
-
-    has_paid_access, paid_reason = await _paid_access_status(partner_group, user_id)
-    if not has_paid_access:
-        try:
-            await api.delete_wall_post(source_group_id, post_id)
-        except Exception:
-            logger.exception("Failed to delete wall post post=%s group=%s", post_id, source_group_id)
-            return
-        try:
-            await _send_paid_access_prompt_to_user(api, user_id, partner_group, paid_reason)
-        except Exception as exc:
-            logger.warning("Failed to notify wall post author about paid access user=%s group=%s: %s", user_id, source_group_id, exc)
-        return
-
-    groups = await _subscription_groups_for_api(api, source_group_id)
-    if not groups:
-        await _consume_paid_message(partner_group, user_id)
-        return
-
-    missing = await _missing_subscription_groups(api, source_group_id, user_id)
-    if not missing:
-        async with UsersSubs() as subs:
-            await subs.add_sub(user_id, source_group_id, "sub_msg")
-        await _consume_paid_message(partner_group, user_id)
-        return
-
-    try:
-        await api.delete_wall_post(source_group_id, post_id)
-    except Exception:
-        logger.exception("Failed to delete wall post post=%s group=%s", post_id, source_group_id)
-        return
-
-    missing_text = "\n".join(f"- {title}" for _, title in missing)
-    try:
-        await api.send_message(
-            user_id,
-            "Ваш пост удален: перед размещением нужно подписаться на сообщества:\n\n"
-            f"{missing_text}\n\nПосле подписки отправьте пост еще раз.",
-            keyboard=kb.subscription_check_kb(groups, source_group_id),
-        )
-    except Exception as exc:
-        logger.warning("Failed to notify wall post author user=%s group=%s: %s", user_id, source_group_id, exc)
 
 
 async def _show_partner_group(ctx: Ctx, group_db_id: int, is_admin_choice: bool = False) -> None:
@@ -697,12 +873,10 @@ async def _show_advert_newsletter_statistics(ctx: Ctx, cursor: int = 0) -> None:
 
 
 def register_handlers(app: VKBotApp) -> None:
-    @app.wall_post
-    async def wall_post(api: VKApi, update: dict[str, Any]) -> None:
-        await _wall_post_guard(api, update)
-
     @app.default
     async def default(ctx: Ctx) -> None:
+        if await _maybe_complete_chat_binding(ctx):
+            return
         if await _chat_guard(ctx):
             return
         if ctx.peer_id > 2_000_000_000:
@@ -809,30 +983,33 @@ def register_handlers(app: VKBotApp) -> None:
 
     @app.state_handler("buy_group")
     async def buy_group_state(ctx: Ctx) -> None:
+        if "token=" in ctx.text.casefold() or "vk1." in ctx.text:
+            await ctx.answer("Ключи здесь не нужны. Укажите peer_id VK-беседы, например 2000001234.")
+            return
+        chat_peer_id = _parse_vk_chat_peer_id(ctx.text)
+        if not chat_peer_id:
+            await ctx.answer(
+                "Укажите peer_id VK-беседы, где бот состоит участником. "
+                "Это число вида 2000001234, его можно получить командой /id в нужной беседе."
+            )
+            return
         try:
-            group = await ctx.api.resolve_group(ctx.text)
+            group_name = await ctx.api.chat_title(chat_peer_id)
+            if not await ctx.api.is_chat_member(chat_peer_id, ctx.user_id):
+                await ctx.answer("Вы не состоите в этой VK-беседе, поэтому я не могу принять ее для подписочной рекламы.")
+                return
         except Exception:
-            await ctx.answer("Не смог найти VK-сообщество. Проверьте ссылку/id и повторите.")
+            await ctx.answer("Не смог получить доступ к VK-беседе. Добавьте бота в беседу и повторите /id.")
             return
 
-        ctx.update_data(ad_group_id=group.id)
-        async with PartnerGroups() as partner_groups:
-            partner_group_ids = await partner_groups.get_all_ids()
-        if not partner_group_ids:
-            await ctx.answer("Пока нет партнерских площадок для подписочной рекламы. Обратитесь к администратору.", keyboard=kb.advertiser_menu())
-            ctx.clear_state()
-            return
-        titles = await _group_titles(ctx.api, partner_group_ids)
-        text = [texts.ADD_GROUP_SUCCESSFUL_TEXT, ""]
-        for index, group_id in enumerate(partner_group_ids, 1):
-            text.append(f"{index}) {titles[group_id]}")
-        ctx.update_data(
-            select_mode="buy_group",
-            select_group_values=partner_group_ids,
-            selected=set(),
-        )
-        await ctx.answer("\n".join(text), keyboard=kb.number_select_kb(len(partner_group_ids), set(), "confirm_select_groups", "buy_ad"))
-        ctx.set_state(None)
+        async with VkGroups() as vk_groups:
+            await vk_groups.upsert(
+                chat_peer_id,
+                title=group_name,
+                screen_name="",
+                target_type="chat",
+            )
+        await _show_buy_group_partner_selector(ctx, chat_peer_id, group_name)
 
     @app.command("select_group")
     async def select_group(ctx: Ctx) -> None:
@@ -948,58 +1125,41 @@ def register_handlers(app: VKBotApp) -> None:
         await ctx.answer(texts.ADD_PARTNER_GROUP, keyboard=kb.back("menu_partner"))
         ctx.set_state("partner_group_id")
 
-    @app.command("add_vk_group_token")
-    async def add_vk_group_token(ctx: Ctx) -> None:
-        await ctx.answer(texts.ADD_VK_GROUP_TOKEN_TEXT, keyboard=kb.back("menu_partner"))
-        ctx.set_state("vk_group_token")
-
-    @app.state_handler("vk_group_token")
-    async def vk_group_token_state(ctx: Ctx) -> None:
+    @app.state_handler("partner_group_id")
+    async def partner_group_id_state(ctx: Ctx) -> None:
         group_ref, token = _extract_group_and_token(ctx.text)
         if not group_ref or not token:
-            await ctx.answer("Нужно отправить сообщество и ключ в одном сообщении. Пример: club123456 vk1.a.xxxxx")
+            await ctx.answer(
+                "Нужно отправить ссылку/ID сообщества и ключ доступа в одном сообщении.\n\n"
+                "Пример: https://vk.com/club123456 token=vk1.a.xxxxx"
+            )
             return
         try:
             group = await ctx.api.resolve_group(group_ref)
+            if isinstance(ctx.api, VKApi):
+                group_api = VKApi(token, group_id=group.id, api_version=ctx.api.api_version)
+                try:
+                    await group_api.group_title(group.id)
+                finally:
+                    await group_api.close()
+            group_id = group.id
+            group_name = group.name
+            group_screen = group.screen_name
         except Exception:
-            await ctx.answer("Не смог найти VK-сообщество. Проверьте ссылку/id и повторите.")
+            logger.exception("Failed to resolve VK community or validate token")
+            await ctx.answer("Не смог проверить сообщество или токен. Проверьте ссылку, токен и права доступа к стене.")
             return
-
         async with VkGroups() as vk_groups:
             await vk_groups.upsert(
-                group.id,
-                title=group.name,
-                screen_name=group.screen_name,
+                group_id,
+                title=group_name,
+                screen_name=group_screen,
                 token=token,
                 target_type="community",
                 can_wall_post=True,
             )
-        ctx.clear_state()
-        await ctx.answer(f"Ключ сохранен для {group.name} (club{group.id}).", keyboard=kb.partner_menu())
-
-    @app.state_handler("partner_group_id")
-    async def partner_group_id_state(ctx: Ctx) -> None:
-        group_ref, token = _extract_group_and_token(ctx.text)
-        if group_ref.lstrip("-").isdigit() and int(group_ref) > 2_000_000_000:
-            group_id = int(group_ref)
-            group_name = f"VK chat {group_id}"
-            group_screen = ""
-            target_type = "chat"
-        else:
-            try:
-                group = await ctx.api.resolve_group(group_ref)
-            except Exception:
-                await ctx.answer("Не смог найти VK-сообщество/чат. Проверьте ссылку/id и повторите.")
-                return
-            group_id = group.id
-            group_name = group.name
-            group_screen = group.screen_name
-            target_type = "community"
-        async with VkGroups() as vk_groups:
-            await vk_groups.upsert(group_id, title=group_name, screen_name=group_screen, token=token, target_type=target_type, can_wall_post=bool(token))
         ctx.update_data(partner_group_id=group_id, partner_group_token=token)
-        token_status = "Токен принят, автопубликация на стену будет доступна." if token else "Токен не указан, автопубликация на стену будет недоступна."
-        await ctx.answer(f"{token_status}\n\n{texts.SELECT_REGION_PARTNER_TEXT}")
+        await ctx.answer(f"Сообщество найдено: {group_name}. Токен сохранен.\n\n{texts.SELECT_REGION_PARTNER_TEXT}")
         ctx.set_state("partner_region")
 
     @app.state_handler("partner_region")
@@ -1136,10 +1296,11 @@ def register_handlers(app: VKBotApp) -> None:
 
         current = []
         for group_id in group["need_groups"] or []:
-            current.append(f"- {await ctx.api.group_title(group_id)} (club{abs(int(group_id))})")
+            current.append(f"- {await ctx.api.group_title(group_id)} ({int(group_id)})")
         text = [
-            "Отправьте VK-сообщества, на которые пользователь должен подписаться перед размещением поста.",
-            "Можно отправить ссылки, club/id или несколько групп через пробел/перенос строки.",
+            "Добавьте бота в VK-беседу, в которую пользователь должен вступить перед сообщением.",
+            "После добавления я продолжу настройку здесь, в личке.",
+            "Если бот уже добавлен, можно отправить один или несколько peer_id через пробел/перенос строки.",
             "Чтобы очистить список, отправьте 0.",
             "",
             "Текущий список:",
@@ -1181,30 +1342,34 @@ def register_handlers(app: VKBotApp) -> None:
             group_ids: list[int] = []
         else:
             if "token=" in raw.lower() or "vk1." in raw:
-                await ctx.answer("В этом поле нужны только ссылки/id групп. Ключи сохраняйте отдельной кнопкой «Сохранить ключ».")
+                await ctx.answer("В этом поле нужны только peer_id VK-бесед. Ключи для бесед не используются.")
                 return
             refs = _split_group_refs(raw)
             if not refs:
-                await ctx.answer("Отправьте хотя бы одну группу или 0 для очистки.")
+                await ctx.answer("Отправьте хотя бы одну беседу или 0 для очистки.")
                 return
             group_ids = []
             seen = set()
             for ref in refs:
-                try:
-                    need_group = await ctx.api.resolve_group(ref)
-                except Exception:
-                    await ctx.answer(f"Не смог найти VK-сообщество: {ref}")
+                need_group_id = _parse_vk_chat_peer_id(ref)
+                if not need_group_id:
+                    await ctx.answer(f"Это не peer_id VK-беседы: {ref}")
                     return
-                if need_group.id in seen:
+                try:
+                    need_group_name = await ctx.api.chat_title(need_group_id)
+                except Exception:
+                    await ctx.answer(f"Не смог получить доступ к VK-беседе: {ref}")
+                    return
+                if need_group_id in seen:
                     continue
-                seen.add(need_group.id)
-                group_ids.append(need_group.id)
+                seen.add(need_group_id)
+                group_ids.append(need_group_id)
                 async with VkGroups() as vk_groups:
                     await vk_groups.upsert(
-                        need_group.id,
-                        title=need_group.name,
-                        screen_name=need_group.screen_name,
-                        target_type="community",
+                        need_group_id,
+                        title=need_group_name,
+                        screen_name="",
+                        target_type="chat",
                     )
 
         async with PartnerGroups() as partner_groups:
