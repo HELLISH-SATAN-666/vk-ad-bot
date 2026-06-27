@@ -212,6 +212,15 @@ class VKBotApp:
                     return
                 if cmd == "check_subs":
                     await self.command_handlers["check_subs"](ctx)
+                    try:
+                        await ctx.api.delete_message(
+                            int(ctx.message.get("id") or 0),
+                            delete_for_all=True,
+                            peer_id=ctx.peer_id,
+                            conversation_message_id=int(ctx.message.get("conversation_message_id") or 0) or None,
+                        )
+                    except Exception:
+                        logger.exception("Failed to delete check_subs command in VK chat peer_id=%s", ctx.peer_id)
                 elif self.default_handler:
                     await self.default_handler(ctx)
                 return

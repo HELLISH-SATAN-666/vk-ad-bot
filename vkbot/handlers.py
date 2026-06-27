@@ -179,7 +179,7 @@ def _is_bot_invite_action(ctx: Ctx) -> bool:
         members = action.get("member_ids") or []
         raw_member_id = members[0] if members else None
     if raw_member_id is None:
-        return ctx.state.get_state(ctx.user_id) in {"buy_group", "partner_group_need_groups"}
+        return ctx.state.get_state(ctx.user_id) in {"partner_group_id", "buy_group", "partner_group_need_groups"}
 
     try:
         member_id = int(raw_member_id)
@@ -200,14 +200,14 @@ async def _delete_message_later(api: VKApi, peer_id: int, message_id: int, delay
         return
     await asyncio.sleep(delay)
     try:
-        await api.delete_message(int(message_id), delete_for_all=True, peer_id=int(peer_id))
+        await api.delete_message(int(message_id), delete_for_all=True)
     except Exception:
         logger.exception("Failed to delete temporary VK bot message peer_id=%s message_id=%s", peer_id, message_id)
 
 
 def _schedule_temporary_delete(api: VKApi, peer_id: int, message_id: int) -> None:
     if message_id:
-        asyncio.create_task(_delete_message_later(api, peer_id, message_id))
+        asyncio.create_task(_delete_message_later(api, peer_id, message_id, delay=SUBSCRIPTION_PROMPT_TTL_SECONDS))
 
 
 async def _answer_private_safely(ctx: Ctx, text: str, keyboard: str | None = None, attachment: str | None = None) -> int:
@@ -261,6 +261,23 @@ async def _show_buy_group_partner_selector(ctx: Ctx, chat_peer_id: int, group_na
     ctx.set_state(None)
 
 
+async def _create_access_chat_group(ctx: Ctx, chat_peer_id: int, group_name: str) -> Any | None:
+    async with VkGroups() as vk_groups:
+        await vk_groups.upsert(chat_peer_id, title=group_name, screen_name="", target_type="chat")
+    async with PartnerGroups() as partner_groups:
+        await partner_groups.add(ctx.user_id, chat_peer_id, [0], [0], PartnerTypes.SUB_GROUPS)
+        group = await partner_groups.get_by_group_id(chat_peer_id)
+    async with Partners() as partners:
+        if not await partners.in_db(ctx.user_id):
+            await partners.add(ctx.user_id)
+            await add_counter(EventType.ADDED_NEW_PARTNER)
+    async with Users() as users:
+        if not await users.in_db(ctx.user_id):
+            await users.add(ctx.user_id)
+        await users.update_status(ctx.user_id, UserStatus.PARTNER)
+    return group
+
+
 async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
     if not ctx.is_chat or not _is_bot_invite_action(ctx):
         return False
@@ -278,10 +295,16 @@ async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
 
     try:
         group_name = await _save_chat_meta(ctx, chat_peer_id)
-        if False and state == "partner_group_id":
-            ctx.update_data(partner_group_id=chat_peer_id, partner_group_token=None)
-            ctx.set_state("partner_region")
-            await _answer_private_safely(ctx, f"Беседа найдена: {group_name}.\n\n{texts.SELECT_REGION_PARTNER_TEXT}")
+        if state == "partner_group_id":
+            group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
+            ctx.clear_state()
+            await _answer_private_safely(
+                ctx,
+                f"Беседа доступа добавлена: {group_name}.\n\n"
+                "Теперь выберите режим доступа: бесплатно по подпискам, платно по времени или платно по сообщениям.",
+            )
+            if group:
+                await _show_partner_group_rates(ctx, int(group["id"]))
             return True
 
         if state == "buy_group":
@@ -488,6 +511,11 @@ async def _paid_access_status(group: Any, user_id: int) -> tuple[bool, str]:
         return False, "messages_left"
 
 
+async def _access_group_for_id(group_id: int) -> Any | None:
+    async with PartnerGroups() as partner_groups:
+        return await partner_groups.get_by_group_id(group_id)
+
+
 async def _consume_paid_message(group: Any, user_id: int) -> None:
     if _sub_rate_type(group) != "msg":
         return
@@ -549,21 +577,11 @@ async def _subscription_partner_group(ctx: Ctx):
     if ctx.peer_id <= 2_000_000_000:
         return None
 
-    async with PartnerGroups() as partner_groups:
-        partner_group = await partner_groups.get_by_group_id(ctx.peer_id)
-        if partner_group and partner_group["partner_type"] in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
-            return partner_group
-
-        linked_partner_groups = await partner_groups.get_by_ad_group_id(ctx.peer_id)
-    if linked_partner_groups:
-        async with AdGroups() as ad_groups:
-            active_ad_groups = await ad_groups.get_by_status(AdGroupsStatus.ACTIVE)
-        if any(int(group["group_id"]) == int(ctx.peer_id) for group in active_ad_groups):
-            return {
-                "group_id": ctx.peer_id,
-                "partner_type": PartnerTypes.SUB_GROUPS,
-                "sub_rate_type": "none",
-            }
+    group = await _access_group_for_id(ctx.peer_id)
+    if not group:
+        return None
+    if group["partner_type"] in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
+        return group
     return None
 
 
@@ -586,8 +604,7 @@ async def _send_subscription_prompt(ctx: Ctx, main_group_id: int, *, mode: str =
 
 
 async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
-    async with PartnerGroups() as partner_groups:
-        partner_group = await partner_groups.get_by_group_id(main_group_id)
+    partner_group = await _access_group_for_id(main_group_id)
     if partner_group:
         has_paid_access, reason = await _paid_access_status(partner_group, ctx.user_id)
         if not has_paid_access:
@@ -596,7 +613,9 @@ async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
 
     groups = await _subscription_groups(ctx, main_group_id)
     if not groups:
-        await ctx.answer("Для этой площадки сейчас нет активных подписочных условий или доступ уже выдан.")
+        message_id = await ctx.answer("Для этой площадки сейчас нет активных подписочных условий или доступ уже выдан.")
+        if ctx.is_chat:
+            _schedule_temporary_delete(ctx.api, ctx.peer_id, message_id)
         return False
 
     missing = await _missing_subscription_groups(ctx.api, main_group_id, ctx.user_id)
@@ -608,7 +627,9 @@ async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
     async with UsersSubs() as subs:
         await subs.add_sub(ctx.user_id, main_group_id, "sub_msg")
     await add_counter(EventType.SUB_BUTTON_PRESSED)
-    await ctx.answer("Подписка подтверждена. Доступ выдан.")
+    message_id = await ctx.answer("Подписка подтверждена. Доступ выдан.")
+    if ctx.is_chat:
+        _schedule_temporary_delete(ctx.api, ctx.peer_id, message_id)
     return True
 
 
@@ -890,8 +911,7 @@ def register_handlers(app: VKBotApp) -> None:
         await _ensure_user(ctx)
         if ctx.ref and str(ctx.ref).lstrip("-").isdigit():
             ref_group_id = int(ctx.ref)
-            async with PartnerGroups() as partner_groups:
-                partner_group = await partner_groups.get_by_group_id(ref_group_id)
+            partner_group = await _access_group_for_id(ref_group_id)
             if partner_group:
                 has_paid_access, paid_reason = await _paid_access_status(partner_group, ctx.user_id)
                 if not has_paid_access and await _send_paid_access_prompt(ctx, partner_group, paid_reason):
@@ -912,8 +932,7 @@ def register_handlers(app: VKBotApp) -> None:
     async def buy_group_access(ctx: Ctx) -> None:
         main_group_id = int(ctx.payload.get("main_group_id") or 0)
         rate_index = int(ctx.payload.get("rate_index") or 0)
-        async with PartnerGroups() as partner_groups:
-            group = await partner_groups.get_by_group_id(main_group_id)
+        group = await _access_group_for_id(main_group_id)
         if not group or _sub_rate_type(group) not in ("time", "msg"):
             await ctx.answer("Для этой площадки сейчас нет платных тарифов.")
             return
@@ -1127,11 +1146,33 @@ def register_handlers(app: VKBotApp) -> None:
 
     @app.state_handler("partner_group_id")
     async def partner_group_id_state(ctx: Ctx) -> None:
+        chat_peer_id = _parse_vk_chat_peer_id(ctx.text)
+        if chat_peer_id:
+            try:
+                group_name = await ctx.api.chat_title(chat_peer_id)
+                if not await ctx.api.is_chat_member(chat_peer_id, ctx.user_id):
+                    await ctx.answer("Вы не состоите в этой VK-беседе, поэтому я не могу принять ее для настройки доступа.")
+                    return
+            except Exception:
+                await ctx.answer("Не смог получить доступ к VK-беседе. Добавьте бота в беседу и повторите /id.")
+                return
+
+            group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
+            ctx.clear_state()
+            await ctx.answer(
+                f"Беседа доступа добавлена: {group_name}.\n\n"
+                "Теперь выберите режим доступа: бесплатно по подпискам, платно по времени или платно по сообщениям."
+            )
+            if group:
+                await _show_partner_group_rates(ctx, int(group["id"]))
+            return
+
         group_ref, token = _extract_group_and_token(ctx.text)
         if not group_ref or not token:
             await ctx.answer(
                 "Нужно отправить ссылку/ID сообщества и ключ доступа в одном сообщении.\n\n"
-                "Пример: https://vk.com/club123456 token=vk1.a.xxxxx"
+                "Пример: https://vk.com/club123456 token=vk1.a.xxxxx\n\n"
+                "Для VK-беседы доступа отправьте peer_id вида 2000001234 без токена."
             )
             return
         try:

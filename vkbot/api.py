@@ -140,8 +140,15 @@ class VKApi:
         except VKApiError:
             if peer_id and conversation_message_id and "cmids" in params:
                 params["conversation_message_ids"] = params.pop("cmids")
-                await self.call("messages.delete", **params)
-                return
+                try:
+                    await self.call("messages.delete", **params)
+                    return
+                except VKApiError:
+                    params.pop("conversation_message_ids", None)
+                    params.pop("peer_id", None)
+                    params["message_ids"] = int(message_id)
+                    await self.call("messages.delete", **params)
+                    return
             raise
 
     async def wall_post(self, owner_id: int, message: str, attachments: Optional[str] = None, from_group: bool = True) -> int:

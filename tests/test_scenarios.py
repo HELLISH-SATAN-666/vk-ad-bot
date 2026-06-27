@@ -40,6 +40,7 @@ from utils.services import check_for_nl_events, check_for_poster_events, get_msk
 from vkbot.api import VKGroupInfo
 from vkbot.api import normalize_group_ref
 from vkbot.app import VKBotApp
+import vkbot.handlers as vk_handlers
 from vkbot.handlers import register_handlers
 
 
@@ -226,6 +227,7 @@ async def main() -> None:
 
     api = FakeVKApi()
     app = VKBotApp(api)  # type: ignore[arg-type]
+    vk_handlers.SUBSCRIPTION_PROMPT_TTL_SECONDS = 0
     register_handlers(app)
 
     admin_id = 1113916884
@@ -237,12 +239,14 @@ async def main() -> None:
     partner_chat_id = 2_000_003_001
     extra_partner_chat_id = 2_000_003_002
     ad_chat_id = 2_000_004_001
+    access_chat_id = 2_000_005_001
     need_chat_id = 2_000_006_001
     api.chat_titles.update(
         {
             partner_chat_id: "Partner chat",
             extra_partner_chat_id: "Extra partner chat",
             ad_chat_id: "Advertiser chat",
+            access_chat_id: "Paid access chat",
             need_chat_id: "Need chat",
         }
     )
@@ -446,8 +450,7 @@ async def main() -> None:
         api=ad_chat_guard_api,  # type: ignore[arg-type]
         guard_only=True,
     )
-    assert any(item.get("deleted_peer_id") == ad_chat_id and item.get("deleted_conversation_message_id") == 9401 for item in ad_chat_guard_api.sent)
-    assert any(item.get("peer_id") == ad_chat_id and "Для того чтобы написать сообщения" in item.get("message", "") for item in ad_chat_guard_api.sent)
+    assert not ad_chat_guard_api.sent
 
     await send(app, admin_id, cmd="manage_ad_groups")
     await send(app, admin_id, cmd="open_ad_group", item_id=ad_group_db_id)
@@ -542,6 +545,147 @@ async def main() -> None:
 
     await send(app, admin_id, cmd="partner_group_need_groups", group_id=sub_partner_group_db_id)
     await send(app, admin_id, "0")
+
+    await send(app, partner_id, cmd="add_bot_group")
+    await send(app, partner_id, str(access_chat_id))
+    assert any("Беседа доступа добавлена" in item.get("message", "") for item in app.api.sent[-3:])
+    async with PartnerGroups() as partner_groups:
+        access_group = await partner_groups.get_by_group_id(access_chat_id)
+        access_group_db_id = access_group["id"]
+        assert access_group["creator_id"] == partner_id
+        assert int(access_group["partner_type"]) == int(PartnerTypes.SUB_GROUPS)
+        assert str(access_group["sub_rate_type"]).strip() == "none"
+    async with VkGroups() as vk_groups:
+        access_vk_group = await vk_groups.get(access_chat_id)
+        assert access_vk_group is not None
+        assert access_vk_group["target_type"] == "chat"
+
+    await send(app, partner_id, cmd="partner_group_need_groups", group_id=access_group_db_id)
+    await send(app, partner_id, str(need_chat_id))
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(access_group_db_id)
+        assert need_chat_id in (group["need_groups"] or [])
+
+    free_access_user_id = 222000012
+    free_access_api = FakeVKApi()
+    free_access_api.chat_titles = api.chat_titles
+    free_access_api.chat_members[(need_chat_id, free_access_user_id)] = False
+    await app.handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": free_access_user_id,
+                    "peer_id": access_chat_id,
+                    "text": "Сообщение без обязательной подписки",
+                    "attachments": [],
+                    "id": 9300,
+                    "conversation_message_id": 9300,
+                }
+            },
+        },
+        api=free_access_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    assert any(item.get("deleted_peer_id") == access_chat_id and item.get("deleted_conversation_message_id") == 9300 for item in free_access_api.sent)
+    assert any(item.get("peer_id") == access_chat_id and "Для того чтобы написать сообщения" in item.get("message", "") for item in free_access_api.sent)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert any(item.get("deleted_message_id") for item in free_access_api.sent)
+    free_access_api.chat_members[(need_chat_id, free_access_user_id)] = True
+    sent_before = len(free_access_api.sent)
+    await app.handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": free_access_user_id,
+                    "peer_id": access_chat_id,
+                    "text": "Проверить подписку",
+                    "payload": payload("check_subs", main_group_id=access_chat_id),
+                    "attachments": [],
+                    "id": 9304,
+                    "conversation_message_id": 9304,
+                }
+            },
+        },
+        api=free_access_api,  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    new_free_access_events = free_access_api.sent[sent_before:]
+    assert any(item.get("deleted_peer_id") == access_chat_id and item.get("deleted_conversation_message_id") == 9304 for item in new_free_access_events)
+    assert any(item.get("peer_id") == access_chat_id and "Подписка подтверждена" in item.get("message", "") for item in new_free_access_events)
+    assert any(item.get("deleted_message_id") for item in new_free_access_events)
+    async with UsersSubs() as subs:
+        assert await subs.in_db(free_access_user_id, access_chat_id)
+
+    await send(app, partner_id, cmd="partner_group_need_groups", group_id=access_group_db_id)
+    await send(app, partner_id, "0")
+    await send(app, partner_id, cmd="partner_group_edit_rates", group_id=access_group_db_id, rate_type="msg")
+    await send(app, partner_id, "2 30\n5 60")
+    await send(app, partner_id, cmd="partner_group_rate_type.msg", group_id=access_group_db_id)
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(access_group_db_id)
+        assert str(group["sub_rate_type"]).strip() == "msg"
+        assert normalize_sub_rates(group["sub_rates"])["msg"][0] == {"msg": 2, "price_rub": 30}
+
+    access_paid_msg_user_id = 222000013
+    await send(app, access_paid_msg_user_id, "start", ref=str(access_chat_id))
+    assert "Доступные тарифы" in app.api.sent[-1]["message"]
+    await send(app, access_paid_msg_user_id, cmd="buy_group_access", main_group_id=access_chat_id, rate_index=0)
+    await send(app, access_paid_msg_user_id, "Оплата доступа в беседу по сообщениям")
+    pay_id = await first_manual_payment_id()
+    await send(app, admin_id, cmd="manual_pay.apply", pay_id=pay_id)
+    async with UsersSubs() as subs:
+        sub = await subs.get_sub(access_paid_msg_user_id, access_chat_id)
+        assert sub is not None
+        assert str(sub["type"]).strip() == "msg"
+        assert sub["msg_left"] == 2
+
+    access_paid_msg_api = FakeVKApi()
+    access_paid_msg_api.chat_titles = api.chat_titles
+    for msg_id in (9301, 9302):
+        await app.handle_update(
+            {
+                "type": "message_new",
+                "object": {
+                    "message": {
+                        "from_id": access_paid_msg_user_id,
+                        "peer_id": access_chat_id,
+                        "text": "Оплаченное сообщение в беседе доступа",
+                        "attachments": [],
+                        "id": msg_id,
+                        "conversation_message_id": msg_id,
+                    }
+                },
+            },
+            api=access_paid_msg_api,  # type: ignore[arg-type]
+            guard_only=True,
+        )
+    async with UsersSubs() as subs:
+        assert not await subs.in_db(access_paid_msg_user_id, access_chat_id)
+
+    await app.handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": access_paid_msg_user_id,
+                    "peer_id": access_chat_id,
+                    "text": "Сообщение сверх лимита в беседе доступа",
+                    "attachments": [],
+                    "id": 9303,
+                    "conversation_message_id": 9303,
+                }
+            },
+        },
+        api=access_paid_msg_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    assert any(item.get("deleted_peer_id") == access_chat_id and item.get("deleted_conversation_message_id") == 9303 for item in access_paid_msg_api.sent)
+    assert any(item.get("peer_id") == access_chat_id and "Рад видеть тебя в группе" in item.get("message", "") for item in access_paid_msg_api.sent)
+
     await send(app, admin_id, cmd="partner_group_rates", group_id=sub_partner_group_db_id)
     await send(app, admin_id, cmd="partner_group_edit_rates", group_id=sub_partner_group_db_id, rate_type="msg")
     await send(app, admin_id, "2 30\n5 60")
@@ -565,7 +709,7 @@ async def main() -> None:
         assert sub["msg_left"] == 2
     async with Payments() as payments:
         sub_access_pays = await payments.get_all(pay_type=PaymentTypes.SUB_ACCESS)
-        assert len(sub_access_pays) == 1
+        assert len(sub_access_pays) >= 2
 
     paid_msg_api = FakeVKApi()
     paid_msg_api.chat_titles = api.chat_titles
