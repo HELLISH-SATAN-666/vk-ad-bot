@@ -84,6 +84,17 @@ def choose_ad_type() -> str:
     )
 
 
+def access_mode_kb(back_cmd: str = "buy_ad") -> str:
+    return keyboard(
+        [
+            [text_button("Бесплатный по подпискам", "buy_group_access_mode.none", "primary")],
+            [text_button("Платный по времени", "buy_group_access_mode.time", "primary")],
+            [text_button("Платный по сообщениям", "buy_group_access_mode.msg", "primary")],
+            [text_button("Назад", back_cmd, "negative")],
+        ]
+    )
+
+
 def newsletter_targets() -> str:
     return keyboard(
         [

@@ -278,6 +278,12 @@ async def _create_access_chat_group(ctx: Ctx, chat_peer_id: int, group_name: str
     return group
 
 
+async def _set_access_chat_rate_type(chat_peer_id: int, rate_type: str) -> Any | None:
+    async with PartnerGroups() as partner_groups:
+        await partner_groups.change_sub_rate_type(chat_peer_id, rate_type)
+        return await partner_groups.get_by_group_id(chat_peer_id)
+
+
 async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
     if not ctx.is_chat or not _is_bot_invite_action(ctx):
         return False
@@ -304,10 +310,26 @@ async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
                 "Теперь выберите режим доступа: бесплатно по подпискам, платно по времени или платно по сообщениям.",
             )
             if group:
-                await _show_partner_group_rates(ctx, int(group["id"]))
+                await _show_partner_group_rates(ctx, int(group["id"]), private=True)
             return True
 
         if state == "buy_group":
+            setup_rate_type = str(ctx.data.get("sub_access_setup_rate_type") or "none")
+            if setup_rate_type in {"time", "msg"}:
+                group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
+                group = await _set_access_chat_rate_type(chat_peer_id, setup_rate_type)
+                ctx.clear_state()
+                type_text = "по времени" if setup_rate_type == "time" else "по сообщениям"
+                await _answer_private_safely(
+                    ctx,
+                    f"Беседа доступа добавлена: {group_name}.\n\n"
+                    f"Режим доступа: {type_text}.\n"
+                    "Базовые тарифы уже применены. Админ может изменить их в управлении площадкой.",
+                    keyboard=kb.advertiser_menu(),
+                )
+                if group:
+                    await _show_partner_group_rates(ctx, int(group["id"]), private=True)
+                return True
             await _show_buy_group_partner_selector(ctx, chat_peer_id, group_name, private=True)
             return True
 
@@ -702,7 +724,7 @@ async def _show_partner_group(ctx: Ctx, group_db_id: int, is_admin_choice: bool 
     )
 
 
-async def _show_partner_group_rates(ctx: Ctx, group_db_id: int, is_admin_choice: bool = False) -> None:
+async def _show_partner_group_rates(ctx: Ctx, group_db_id: int, is_admin_choice: bool = False, *, private: bool = False) -> None:
     async with PartnerGroups() as partner_groups:
         group = await partner_groups.get_by_db_id(group_db_id)
     if not group:
@@ -721,7 +743,7 @@ async def _show_partner_group_rates(ctx: Ctx, group_db_id: int, is_admin_choice:
         [kb.text_button("Назад", "open_partner_group", "negative", item_id=group_db_id)],
     ]
     ctx.update_data(is_admin_choice=is_admin_choice)
-    await ctx.answer(_format_access_rates(group), keyboard=kb.keyboard(rows))
+    await _answer_flow(ctx, _format_access_rates(group), private=private, keyboard=kb.keyboard(rows))
 
 
 async def _show_poster(ctx: Ctx, poster_id: int) -> None:
@@ -994,14 +1016,49 @@ def register_handlers(app: VKBotApp) -> None:
             await ctx.answer(texts.BUY_POSTER_AD_TEXT.format(texts.categories_text()), keyboard=kb.back("buy_ad"))
             ctx.set_state("buy_poster")
         elif ad_type == "group":
-            await ctx.answer(texts.BUY_GROUP_AD_TEXT, keyboard=kb.back("buy_ad"))
-            ctx.set_state("buy_group")
+            await ctx.answer(
+                "Выберите, какой доступ по подписке нужен для VK-беседы:",
+                keyboard=kb.access_mode_kb("buy_ad"),
+            )
+            ctx.set_state(None)
         elif ad_type == "newsletter":
             await ctx.answer(texts.BUY_NEWSLETTER_AD_TEXT, keyboard=kb.back("buy_ad"))
             ctx.set_state("buy_newsletter")
 
+    @app.command_prefix("buy_group_access_mode.")
+    async def buy_group_access_mode(ctx: Ctx) -> None:
+        rate_type = ctx.cmd.split(".")[-1]
+        if rate_type not in {"none", "time", "msg"}:
+            await ctx.answer("Неверный режим доступа.", keyboard=kb.access_mode_kb("buy_ad"))
+            return
+        ctx.update_data(sub_access_setup_rate_type=rate_type)
+        if rate_type == "none":
+            text = (
+                "Выбран бесплатный доступ по подпискам.\n\n"
+                + texts.BUY_GROUP_AD_TEXT
+            )
+        elif rate_type == "time":
+            text = (
+                "Выбран платный доступ по времени.\n\n"
+                "Добавьте бота в VK-беседу, доступ в которую нужно продавать по сроку, "
+                "или отправьте peer_id вида 2000001234."
+            )
+        else:
+            text = (
+                "Выбран платный доступ по количеству сообщений.\n\n"
+                "Добавьте бота в VK-беседу, доступ в которую нужно продавать по лимиту сообщений, "
+                "или отправьте peer_id вида 2000001234."
+            )
+        await ctx.answer(text, keyboard=kb.back("buy_ad.group"))
+        ctx.set_state("buy_group")
+
     @app.state_handler("buy_group")
     async def buy_group_state(ctx: Ctx) -> None:
+        setup_rate_type = str(ctx.data.get("sub_access_setup_rate_type") or "")
+        if setup_rate_type not in {"none", "time", "msg"}:
+            await ctx.answer("Сначала выберите режим доступа.", keyboard=kb.access_mode_kb("buy_ad"))
+            ctx.set_state(None)
+            return
         if "token=" in ctx.text.casefold() or "vk1." in ctx.text:
             await ctx.answer("Ключи здесь не нужны. Укажите peer_id VK-беседы, например 2000001234.")
             return
@@ -1028,6 +1085,20 @@ def register_handlers(app: VKBotApp) -> None:
                 screen_name="",
                 target_type="chat",
             )
+        if setup_rate_type in {"time", "msg"}:
+            group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
+            group = await _set_access_chat_rate_type(chat_peer_id, setup_rate_type)
+            ctx.clear_state()
+            type_text = "по времени" if setup_rate_type == "time" else "по сообщениям"
+            await ctx.answer(
+                f"Беседа доступа добавлена: {group_name}.\n\n"
+                f"Режим доступа: {type_text}.\n"
+                "Базовые тарифы уже применены. Админ может изменить их в управлении площадкой.",
+                keyboard=kb.advertiser_menu(),
+            )
+            if group:
+                await _show_partner_group_rates(ctx, int(group["id"]))
+            return
         await _show_buy_group_partner_selector(ctx, chat_peer_id, group_name)
 
     @app.command("select_group")

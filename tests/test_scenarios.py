@@ -241,6 +241,7 @@ async def main() -> None:
     ad_chat_id = 2_000_004_001
     access_chat_id = 2_000_005_001
     need_chat_id = 2_000_006_001
+    paid_setup_chat_id = 2_000_007_001
     api.chat_titles.update(
         {
             partner_chat_id: "Partner chat",
@@ -248,6 +249,7 @@ async def main() -> None:
             ad_chat_id: "Advertiser chat",
             access_chat_id: "Paid access chat",
             need_chat_id: "Need chat",
+            paid_setup_chat_id: "Client paid setup chat",
         }
     )
 
@@ -394,6 +396,8 @@ async def main() -> None:
     assert await manual_payment_count() == 0
 
     await send(app, advertiser_id, cmd="buy_ad.group")
+    assert "какой доступ по подписке" in app.api.sent[-1]["message"]
+    await send(app, advertiser_id, cmd="buy_group_access_mode.none")
     await send(app, advertiser_id, "club4001")
     assert "peer_id VK-беседы" in app.api.sent[-1]["message"]
     sent_before = len(app.api.sent)
@@ -428,6 +432,30 @@ async def main() -> None:
         protected_vk_group = await vk_groups.get(ad_chat_id)
         assert protected_vk_group is not None
         assert protected_vk_group["target_type"] == "chat"
+
+    paid_setup_user_id = 222000014
+    await send(app, paid_setup_user_id, "start")
+    await send(app, paid_setup_user_id, cmd="buy_ad.group")
+    await send(app, paid_setup_user_id, cmd="buy_group_access_mode.time")
+    await send(app, paid_setup_user_id, str(paid_setup_chat_id))
+    assert any("Режим доступа: по времени" in item.get("message", "") for item in app.api.sent[-3:])
+    async with PartnerGroups() as partner_groups:
+        paid_setup_group = await partner_groups.get_by_group_id(paid_setup_chat_id)
+        paid_setup_group_db_id = paid_setup_group["id"]
+        assert paid_setup_group["creator_id"] == paid_setup_user_id
+        assert int(paid_setup_group["partner_type"]) == int(PartnerTypes.SUB_GROUPS)
+        assert str(paid_setup_group["sub_rate_type"]).strip() == "time"
+        assert normalize_sub_rates(paid_setup_group["sub_rates"])["time"]
+    await send(app, admin_id, cmd="partner_group_edit_rates", group_id=paid_setup_group_db_id, rate_type="time")
+    await send(app, admin_id, "14 99\n30 150")
+    await send(app, admin_id, cmd="partner_group_rate_type.time", group_id=paid_setup_group_db_id)
+    async with PartnerGroups() as partner_groups:
+        paid_setup_group = await partner_groups.get_by_db_id(paid_setup_group_db_id)
+        assert normalize_sub_rates(paid_setup_group["sub_rates"])["time"][0] == {"days": 14, "price_rub": 99}
+    paid_setup_reader_id = 222000015
+    await send(app, paid_setup_reader_id, "start", ref=str(paid_setup_chat_id))
+    assert "Доступные тарифы" in app.api.sent[-1]["message"]
+    assert "14 дн." in app.api.sent[-1]["message"]
 
     ad_chat_guard_api = FakeVKApi()
     ad_chat_guard_api.chat_titles = api.chat_titles
@@ -537,7 +565,8 @@ async def main() -> None:
     assert any(item.get("peer_id") == partner_chat_id and "Необходимо подписаться на группы и не отписываться" in item.get("message", "") for item in resubscribe_api.sent)
 
     await send(app, admin_id, cmd="ad_group_select_groups", ad_group_id=ad_group_db_id)
-    await send(app, admin_id, cmd="select_group", num="1")
+    sub_partner_num = str((app.state.get_data(admin_id)["select_group_values"]).index(partner_chat_id) + 1)
+    await send(app, admin_id, cmd="select_group", num=sub_partner_num)
     await send(app, admin_id, cmd="confirm_ad_group_groups")
     async with PartnerGroups() as partner_groups:
         group = await partner_groups.get_by_db_id(sub_partner_group_db_id)
