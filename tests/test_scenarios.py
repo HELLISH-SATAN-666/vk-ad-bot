@@ -478,7 +478,16 @@ async def main() -> None:
         api=ad_chat_guard_api,  # type: ignore[arg-type]
         guard_only=True,
     )
-    assert not ad_chat_guard_api.sent
+    assert any(item.get("deleted_peer_id") == ad_chat_id and item.get("deleted_conversation_message_id") == 9401 for item in ad_chat_guard_api.sent)
+    assert any(item.get("peer_id") == ad_chat_id and "Для того чтобы написать сообщения" in item.get("message", "") for item in ad_chat_guard_api.sent)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert any(
+        item.get("deleted_peer_id") == ad_chat_id
+        and item.get("deleted_conversation_message_id")
+        and item.get("deleted_conversation_message_id") != 9401
+        for item in ad_chat_guard_api.sent
+    )
 
     await send(app, admin_id, cmd="manage_ad_groups")
     await send(app, admin_id, cmd="open_ad_group", item_id=ad_group_db_id)

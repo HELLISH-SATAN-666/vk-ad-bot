@@ -608,11 +608,22 @@ async def _subscription_partner_group(ctx: Ctx):
     if ctx.peer_id <= 2_000_000_000:
         return None
 
-    group = await _access_group_for_id(ctx.peer_id)
-    if not group:
-        return None
-    if group["partner_type"] in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
-        return group
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_group_id(ctx.peer_id)
+        if group and group["partner_type"] in (PartnerTypes.SUB_GROUPS, PartnerTypes.PROMOTION_AND_SUB):
+            return group
+
+        linked_partner_groups = await partner_groups.get_by_ad_group_id(ctx.peer_id)
+
+    if linked_partner_groups:
+        async with AdGroups() as ad_groups:
+            active_ad_groups = await ad_groups.get_by_status(AdGroupsStatus.ACTIVE)
+        if any(int(group["group_id"]) == int(ctx.peer_id) for group in active_ad_groups):
+            return {
+                "group_id": ctx.peer_id,
+                "partner_type": PartnerTypes.SUB_GROUPS,
+                "sub_rate_type": "none",
+            }
     return None
 
 
