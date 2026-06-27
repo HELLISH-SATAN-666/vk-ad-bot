@@ -782,6 +782,23 @@ async def main() -> None:
     )
     assert any(item.get("deleted_message_id") == 9103 for item in paid_msg_api.sent)
     assert any(item.get("peer_id") == partner_chat_id and "Рад видеть тебя в группе" in item.get("message", "") for item in paid_msg_api.sent)
+    paid_prompt = next(
+        item
+        for item in paid_msg_api.sent
+        if item.get("peer_id") == partner_chat_id and "Доступные тарифы" in item.get("message", "")
+    )
+    paid_prompt_keyboard = json.loads(paid_prompt["keyboard"])
+    paid_prompt_action = paid_prompt_keyboard["buttons"][0][0]["action"]
+    assert paid_prompt_action["type"] == "open_link"
+    assert f"ref={partner_chat_id}" in paid_prompt_action["link"]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert any(
+        item.get("deleted_peer_id") == partner_chat_id
+        and item.get("deleted_conversation_message_id")
+        and item.get("deleted_conversation_message_id") != 9103
+        for item in paid_msg_api.sent
+    )
 
     await send(app, admin_id, cmd="partner_group_edit_rates", group_id=sub_partner_group_db_id, rate_type="time")
     await send(app, admin_id, "7 70")

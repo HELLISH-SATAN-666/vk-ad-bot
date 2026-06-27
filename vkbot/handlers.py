@@ -200,7 +200,12 @@ async def _delete_message_later(api: VKApi, peer_id: int, message_id: int, delay
         return
     await asyncio.sleep(delay)
     try:
-        await api.delete_message(int(message_id), delete_for_all=True)
+        await api.delete_message(
+            int(message_id),
+            delete_for_all=True,
+            peer_id=int(peer_id),
+            conversation_message_id=int(message_id),
+        )
     except Exception:
         logger.exception("Failed to delete temporary VK bot message peer_id=%s message_id=%s", peer_id, message_id)
 
@@ -577,10 +582,14 @@ async def _send_paid_access_prompt(ctx: Ctx, group: Any, reason: str = "not_paid
     if ctx.is_chat:
         text = (
             f"Привет {await _vk_user_mention(ctx.api, ctx.user_id)}. Рад видеть тебя в группе, "
-            "чтобы размещать объявления, необходимо зарегистрироваться через наш бот по кнопке\n\n"
+            "чтобы писать в этом чате, необходимо купить доступ в личке бота по кнопке ниже.\n\n"
             + text
         )
-    message_id = await ctx.answer(text, keyboard=_paid_access_kb(group))
+        bot_group_id = abs(int(ctx.api.group_id or 0))
+        keyboard = kb.open_bot_link(bot_group_id, int(group["group_id"]), "Купить доступ") if bot_group_id else None
+    else:
+        keyboard = _paid_access_kb(group)
+    message_id = await ctx.answer(text, keyboard=keyboard)
     if ctx.is_chat:
         _schedule_temporary_delete(ctx.api, ctx.peer_id, message_id)
     return True
