@@ -30,7 +30,7 @@ from database import (
 from database.ad_groups import AdGroupsStatus
 from vkbot.api import VKApi
 from utils import keyboards as kb
-from utils.config import env_int, get_rates, write_json
+from utils.config import env_int, get_admins, get_rates, write_json
 
 
 logger = logging.getLogger(__name__)
@@ -128,10 +128,15 @@ async def send_log(api: VKApi, text: str, keyboard: Optional[str] = None, attach
     peers = []
     if log_peer and log_peer.lstrip("-").isdigit():
         peers.append(int(log_peer))
-    else:
-        from utils.config import get_admins
-
-        peers.extend(get_admins())
+    peers.extend(get_admins())
+    try:
+        peers.extend(await api.get_group_managers())
+    except Exception:
+        logger.exception("Failed to load VK group managers for admin log")
+    peers = list(dict.fromkeys(peers))
+    if not peers:
+        logger.warning("Admin log skipped because LOG_PEER_ID and ADMINS are empty")
+        return
 
     for peer_id in peers:
         try:

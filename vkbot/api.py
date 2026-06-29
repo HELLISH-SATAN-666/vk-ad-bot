@@ -265,6 +265,20 @@ class VKApi:
                 return True
         return False
 
+    async def get_group_managers(self, group_id: Optional[int] = None) -> list[int]:
+        gid = group_id or self.group_id
+        if not gid:
+            return []
+        response = await self.call("groups.getMembers", group_id=abs(int(gid)), filter="managers")
+        items = response.get("items", []) if isinstance(response, dict) else []
+        managers: list[int] = []
+        for item in items:
+            try:
+                managers.append(int(item.get("id") if isinstance(item, dict) else item))
+            except (TypeError, ValueError):
+                continue
+        return managers
+
 class VKLongPoll:
     def __init__(self, api: VKApi, group_id: int):
         self.api = api

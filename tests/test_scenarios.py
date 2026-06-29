@@ -101,6 +101,9 @@ class FakeVKApi:
     async def is_group_manager(self, user_id: int, group_id: int | None = None) -> bool:
         return user_id == 1113916884
 
+    async def get_group_managers(self, group_id: int | None = None) -> list[int]:
+        return [1113916884]
+
     async def delete_message(self, message_id: int, delete_for_all: bool = True, peer_id: int | None = None, conversation_message_id: int | None = None):
         self.sent.append(
             {
@@ -334,8 +337,21 @@ async def main() -> None:
     await send(app, advertiser_id, f"{first_category}\nТестовое объявление")
     await send(app, advertiser_id, "0")
     await send(app, advertiser_id, "1")
+    os.environ["ADMINS"] = ""
+    os.environ["LOG_PEER_ID"] = "222000099"
+    sent_before_payment = len(app.api.sent)
     await send(app, advertiser_id, "Оплата тестового объявления")
+    os.environ.pop("LOG_PEER_ID", None)
+    os.environ["ADMINS"] = str(admin_id)
+    payment_notifications = app.api.sent[sent_before_payment:]
+    assert any(item.get("peer_id") == 222000099 for item in payment_notifications)
+    assert any(item.get("peer_id") == admin_id for item in payment_notifications)
     pay_id = await first_manual_payment_id()
+    await send(app, admin_id, cmd="manual_payments")
+    assert any(
+        item.get("peer_id") == admin_id and f"Оплата #{pay_id}" in item.get("message", "")
+        for item in app.api.sent[-3:]
+    )
     await send(app, admin_id, cmd="manual_pay.apply", pay_id=pay_id)
 
     async with Posters() as posters:
@@ -412,10 +428,7 @@ async def main() -> None:
     )
     await send(app, advertiser_id, cmd="select_group", num="1")
     await send(app, advertiser_id, cmd="confirm_select_groups")
-    await send(app, advertiser_id, "1")
-    await send(app, advertiser_id, "Оплата тестовой группы")
-    pay_id = await first_manual_payment_id()
-    await send(app, admin_id, cmd="manual_pay.apply", pay_id=pay_id)
+    assert await manual_payment_count() == 0
 
     async with AdGroups() as ad_groups:
         groups = await ad_groups.get_all()
@@ -426,8 +439,7 @@ async def main() -> None:
 
     async with Payments() as payments:
         ad_group_pays = await payments.get_all(pay_type=PaymentTypes.AD_GROUP)
-        assert len(ad_group_pays) == 1
-        assert ad_group_pays[0]["type"] == PaymentTypes.AD_GROUP
+        assert len(ad_group_pays) == 0
     async with VkGroups() as vk_groups:
         protected_vk_group = await vk_groups.get(ad_chat_id)
         assert protected_vk_group is not None

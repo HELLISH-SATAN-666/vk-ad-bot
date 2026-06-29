@@ -32,7 +32,7 @@ from database import (
 from database.partner_groups import normalize_sub_rates
 from utils import keyboards as kb
 from utils import texts
-from utils.config import BASE_DIR, get_ad_categories, get_admins, get_regions, get_settings_var_names
+from utils.config import BASE_DIR, env_int, get_ad_categories, get_admins, get_regions, get_settings_var_names
 from utils.services import (
     activate_payment_state,
     add_counter,
@@ -43,6 +43,7 @@ from utils.services import (
     reject_payment,
     send_log,
     send_newsletter,
+    write_ad_group_content,
 )
 from vkbot.app import Ctx, VKBotApp
 from vkbot.api import VKApi, is_vk_chat_peer_id
@@ -287,6 +288,39 @@ async def _set_access_chat_rate_type(chat_peer_id: int, rate_type: str) -> Any |
     async with PartnerGroups() as partner_groups:
         await partner_groups.change_sub_rate_type(chat_peer_id, rate_type)
         return await partner_groups.get_by_group_id(chat_peer_id)
+
+
+async def _activate_free_subscription_access(ctx: Ctx, selected_group_ids: list[int]) -> None:
+    advertiser_id = int(ctx.data["from_user"])
+    ad_group_id = int(ctx.data["ad_group_id"])
+    period = env_int("FREE_SUBSCRIPTION_ACCESS_DAYS", 3650)
+
+    async with Users() as users:
+        if not await users.in_db(advertiser_id):
+            await users.add(advertiser_id)
+        await users.update_status(advertiser_id, UserStatus.ADVERTISER)
+
+    await write_ad_group_content(advertiser_id, period, ad_group_id)
+    async with VkGroups() as vk_groups:
+        await vk_groups.upsert(
+            ad_group_id,
+            title=ctx.data.get("ad_group_title"),
+            screen_name=ctx.data.get("ad_group_screen_name") or "",
+            target_type="chat",
+        )
+    async with PartnerGroups() as partner_groups:
+        for partner_group_id in selected_group_ids:
+            await partner_groups.add_need_groups(partner_group_id, ad_group_id)
+
+    ctx.clear_state()
+    await ctx.answer(
+        "Бесплатный доступ по подпискам включен. Беседа добавлена в подписочные условия выбранных площадок.",
+        keyboard=kb.advertiser_menu(),
+    )
+    await send_log(
+        ctx.api,
+        f"Включен бесплатный доступ по подпискам для VK-беседы {ad_group_id}.",
+    )
 
 
 async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
@@ -1144,6 +1178,9 @@ def register_handlers(app: VKBotApp) -> None:
             return
         selected_group_ids = [values[int(num) - 1] for num in sorted(selected, key=int)]
         ctx.update_data(selected_group_ids=selected_group_ids)
+        if ctx.data.get("sub_access_setup_rate_type") == "none":
+            await _activate_free_subscription_access(ctx, list(map(int, selected_group_ids)))
+            return
         await ctx.answer("Теперь напишите количество дней покупки, например 8.")
         ctx.set_state("buy_ad_period")
 
@@ -1907,7 +1944,7 @@ def register_handlers(app: VKBotApp) -> None:
             await ctx.answer("Ручных оплат нет.", keyboard=kb.back("menu_adminpanel"))
             return
         for payment in all_payments[:10]:
-            state = payment["payment_state"]
+            state = await payments.get_payment_state(payment["id"]) or {}
             await ctx.answer(
                 f"Оплата #{payment['id']}\nПользователь: {state.get('from_user')}\nТип: {state.get('ad_type')}\nСумма: {state.get('current_pay_info', {}).get('sum')} ₽",
                 keyboard=kb.manual_payment_kb(payment["id"]),
