@@ -50,7 +50,7 @@ from vkbot.api import VKApi, is_vk_chat_peer_id
 
 
 logger = logging.getLogger(__name__)
-SUBSCRIPTION_PROMPT_TTL_SECONDS = 90
+SUBSCRIPTION_PROMPT_TTL_SECONDS = 20
 
 
 def _is_config_admin(user_id: int) -> bool:
@@ -201,12 +201,7 @@ async def _delete_message_later(api: VKApi, peer_id: int, message_id: int, delay
         return
     await asyncio.sleep(delay)
     try:
-        await api.delete_message(
-            int(message_id),
-            delete_for_all=True,
-            peer_id=int(peer_id),
-            conversation_message_id=int(message_id),
-        )
+        await api.delete_message_everywhere(int(message_id), int(peer_id), delete_for_all=True)
     except Exception:
         logger.exception("Failed to delete temporary VK bot message peer_id=%s message_id=%s", peer_id, message_id)
 

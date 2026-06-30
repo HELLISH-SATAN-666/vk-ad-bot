@@ -38,6 +38,7 @@ from database.schema import ensure_schema
 from utils.config import BASE_DIR, get_ad_categories
 from utils.services import check_for_nl_events, check_for_poster_events, get_msk_now
 from vkbot.api import VKGroupInfo
+from vkbot.api import VKApi
 from vkbot.api import normalize_group_ref
 from vkbot.app import VKBotApp
 import vkbot.handlers as vk_handlers
@@ -112,6 +113,15 @@ class FakeVKApi:
                 "deleted_conversation_message_id": conversation_message_id,
                 "delete_for_all": delete_for_all,
             }
+        )
+
+    async def delete_message_everywhere(self, message_id: int, peer_id: int, delete_for_all: bool = True):
+        await self.delete_message(message_id, delete_for_all=delete_for_all)
+        await self.delete_message(
+            message_id,
+            delete_for_all=delete_for_all,
+            peer_id=peer_id,
+            conversation_message_id=message_id,
         )
 
     async def wall_post(self, owner_id: int, message: str, attachments=None, from_group=True):
@@ -222,6 +232,10 @@ async def main() -> None:
     assert normalize_group_ref("https://vk.com/club123456?from=search") == "123456"
     assert normalize_group_ref("m.vk.com/public987#wall") == "987"
     assert normalize_group_ref("@screen_name") == "screen_name"
+    assert VKApi._sent_message_id(
+        [{"peer_id": 2_000_000_001, "message_id": 0, "conversation_message_id": 321}],
+        2_000_000_001,
+    ) == 321
 
     load_dotenv(BASE_DIR / ".env", override=True)
     os.environ["DB_NAME"] = "vk_ad_bot_test"
@@ -230,6 +244,7 @@ async def main() -> None:
 
     api = FakeVKApi()
     app = VKBotApp(api)  # type: ignore[arg-type]
+    assert vk_handlers.SUBSCRIPTION_PROMPT_TTL_SECONDS == 20
     vk_handlers.SUBSCRIPTION_PROMPT_TTL_SECONDS = 0
     register_handlers(app)
 
@@ -495,6 +510,12 @@ async def main() -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert any(
+        item.get("deleted_message_id")
+        and item.get("deleted_peer_id") is None
+        and item.get("deleted_conversation_message_id") is None
+        for item in ad_chat_guard_api.sent
+    )
+    assert any(
         item.get("deleted_peer_id") == ad_chat_id
         and item.get("deleted_conversation_message_id")
         and item.get("deleted_conversation_message_id") != 9401
@@ -641,7 +662,18 @@ async def main() -> None:
     assert any(item.get("peer_id") == access_chat_id and "Для того чтобы написать сообщения" in item.get("message", "") for item in free_access_api.sent)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert any(item.get("deleted_message_id") for item in free_access_api.sent)
+    assert any(
+        item.get("deleted_message_id")
+        and item.get("deleted_peer_id") is None
+        and item.get("deleted_conversation_message_id") is None
+        for item in free_access_api.sent
+    )
+    assert any(
+        item.get("deleted_peer_id") == access_chat_id
+        and item.get("deleted_conversation_message_id")
+        and item.get("deleted_conversation_message_id") != 9300
+        for item in free_access_api.sent
+    )
     free_access_api.chat_members[(need_chat_id, free_access_user_id)] = True
     sent_before = len(free_access_api.sent)
     await app.handle_update(
@@ -666,7 +698,18 @@ async def main() -> None:
     new_free_access_events = free_access_api.sent[sent_before:]
     assert any(item.get("deleted_peer_id") == access_chat_id and item.get("deleted_conversation_message_id") == 9304 for item in new_free_access_events)
     assert any(item.get("peer_id") == access_chat_id and "Подписка подтверждена" in item.get("message", "") for item in new_free_access_events)
-    assert any(item.get("deleted_message_id") for item in new_free_access_events)
+    assert any(
+        item.get("deleted_message_id")
+        and item.get("deleted_peer_id") is None
+        and item.get("deleted_conversation_message_id") is None
+        for item in new_free_access_events
+    )
+    assert any(
+        item.get("deleted_peer_id") == access_chat_id
+        and item.get("deleted_conversation_message_id")
+        and item.get("deleted_conversation_message_id") != 9304
+        for item in new_free_access_events
+    )
     async with UsersSubs() as subs:
         assert await subs.in_db(free_access_user_id, access_chat_id)
 
@@ -814,6 +857,12 @@ async def main() -> None:
     assert f"ref={partner_chat_id}" in paid_prompt_action["link"]
     await asyncio.sleep(0)
     await asyncio.sleep(0)
+    assert any(
+        item.get("deleted_message_id")
+        and item.get("deleted_peer_id") is None
+        and item.get("deleted_conversation_message_id") is None
+        for item in paid_msg_api.sent
+    )
     assert any(
         item.get("deleted_peer_id") == partner_chat_id
         and item.get("deleted_conversation_message_id")

@@ -96,11 +96,15 @@ class VKApi:
         disable_mentions: bool = True,
     ) -> int:
         params = {
-            "peer_id": peer_id,
             "message": message[:4096],
             "random_id": random.randint(1, 2_147_483_647),
             "disable_mentions": 1 if disable_mentions else 0,
         }
+        use_peer_ids = bool(self.group_id) and is_vk_chat_peer_id(peer_id)
+        if use_peer_ids:
+            params["peer_ids"] = int(peer_id)
+        else:
+            params["peer_id"] = int(peer_id)
         if keyboard:
             params["keyboard"] = keyboard
         if attachment:
@@ -114,7 +118,21 @@ class VKApi:
                 response = await self.call("messages.send", **params)
             else:
                 raise
-        return int(response)
+        return self._sent_message_id(response, int(peer_id))
+
+    @staticmethod
+    def _sent_message_id(response: Any, peer_id: int) -> int:
+        if isinstance(response, list):
+            item = next(
+                (value for value in response if isinstance(value, dict) and int(value.get("peer_id") or 0) == int(peer_id)),
+                response[0] if response else None,
+            )
+            if isinstance(item, dict):
+                return int(item.get("conversation_message_id") or item.get("message_id") or 0)
+            return 0
+        if isinstance(response, dict):
+            return int(response.get("conversation_message_id") or response.get("message_id") or 0)
+        return int(response or 0)
 
     async def edit_message(self, peer_id: int, message_id: int, message: str, keyboard: Optional[str] = None) -> None:
         params = {"peer_id": peer_id, "conversation_message_id": message_id, "message": message[:4096]}
@@ -150,6 +168,25 @@ class VKApi:
                     await self.call("messages.delete", **params)
                     return
             raise
+
+    async def delete_message_everywhere(self, message_id: int, peer_id: int, delete_for_all: bool = True) -> None:
+        base = {"delete_for_all": 1 if delete_for_all else 0}
+        variants = [
+            {**base, "message_ids": int(message_id)},
+            {**base, "peer_id": int(peer_id), "cmids": int(message_id)},
+            {**base, "peer_id": int(peer_id), "conversation_message_ids": int(message_id)},
+        ]
+        last_error: VKApiError | None = None
+        success_count = 0
+        for params in variants:
+            try:
+                await self.call("messages.delete", **params)
+                success_count += 1
+            except VKApiError as exc:
+                last_error = exc
+                logger.debug("VK delete variant failed: %s params=%s", exc, params)
+        if success_count == 0 and last_error is not None:
+            raise last_error
 
     async def wall_post(self, owner_id: int, message: str, attachments: Optional[str] = None, from_group: bool = True) -> int:
         params: dict[str, Any] = {
