@@ -443,6 +443,9 @@ async def main() -> None:
     )
     await send(app, advertiser_id, cmd="select_group", num="1")
     await send(app, advertiser_id, cmd="confirm_select_groups")
+    assert "Дублировать сообщения участников" in app.api.sent[-1]["message"]
+    await send(app, advertiser_id, cmd="access_chat_wall_duplicate.no", chat_peer_id=ad_chat_id, group_id=0)
+    assert "Дублирование сообщений на стену выключено" in app.api.sent[-1]["message"]
     assert await manual_payment_count() == 0
 
     async with AdGroups() as ad_groups:
@@ -631,6 +634,18 @@ async def main() -> None:
         assert access_vk_group is not None
         assert access_vk_group["target_type"] == "chat"
 
+    await send(app, partner_id, cmd="access_chat_wall_duplicate.yes", chat_peer_id=access_chat_id, group_id=access_group_db_id)
+    assert "Ключ должен принадлежать" in app.api.sent[-1]["message"]
+    await send(app, partner_id, "club3100 token=dup-token")
+    assert any("Дублирование включено" in item.get("message", "") for item in app.api.sent[-3:])
+    async with VkGroups() as vk_groups:
+        access_vk_group = await vk_groups.get(access_chat_id)
+        duplicate_wall_group = await vk_groups.get(3100)
+        assert access_vk_group["duplicate_wall_enabled"]
+        assert access_vk_group["duplicate_wall_group_id"] == 3100
+        assert duplicate_wall_group["token"] == "dup-token"
+        assert duplicate_wall_group["can_wall_post"]
+
     await send(app, partner_id, cmd="partner_group_need_groups", group_id=access_group_db_id)
     await send(app, partner_id, str(need_chat_id))
     async with PartnerGroups() as partner_groups:
@@ -712,6 +727,31 @@ async def main() -> None:
     )
     async with UsersSubs() as subs:
         assert await subs.in_db(free_access_user_id, access_chat_id)
+
+    sent_before = len(free_access_api.sent)
+    await app.handle_update(
+        {
+            "type": "message_new",
+            "object": {
+                "message": {
+                    "from_id": free_access_user_id,
+                    "peer_id": access_chat_id,
+                    "text": "Разрешенное объявление для стены",
+                    "attachments": [],
+                    "id": 9305,
+                    "conversation_message_id": 9305,
+                }
+            },
+        },
+        api=free_access_api,  # type: ignore[arg-type]
+        guard_only=True,
+    )
+    new_wall_events = free_access_api.sent[sent_before:]
+    duplicated_post = next(item for item in new_wall_events if item.get("wall_group_id") == 3100)
+    assert duplicated_post["message"].startswith("Разрешенное объявление для стены")
+    assert "\n\nАвтор: [id222000012|User 222000012]" in duplicated_post["message"]
+    assert duplicated_post["message"].find("Разрешенное объявление для стены") < duplicated_post["message"].find("Автор:")
+    assert "Купить рекламу: https://vk.com/write-239792902?ref=3100" in duplicated_post["message"]
 
     await send(app, partner_id, cmd="partner_group_need_groups", group_id=access_group_db_id)
     await send(app, partner_id, "0")

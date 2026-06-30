@@ -374,6 +374,15 @@ def manual_payment_kb(pay_id: int) -> str:
     )
 
 
+def access_chat_wall_duplicate_kb(chat_peer_id: int, group_id: int) -> str:
+    return keyboard(
+        [
+            [text_button("Да", "access_chat_wall_duplicate.yes", "positive", chat_peer_id=chat_peer_id, group_id=group_id)],
+            [text_button("Нет", "access_chat_wall_duplicate.no", "negative", chat_peer_id=chat_peer_id, group_id=group_id)],
+        ]
+    )
+
+
 def newsletter_type_kb() -> str:
     return keyboard(
         [

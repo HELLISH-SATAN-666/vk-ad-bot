@@ -285,6 +285,50 @@ async def _set_access_chat_rate_type(chat_peer_id: int, rate_type: str) -> Any |
         return await partner_groups.get_by_group_id(chat_peer_id)
 
 
+async def _ask_access_chat_wall_duplicate(
+    ctx: Ctx,
+    chat_peer_id: int,
+    group_name: str,
+    group_db_id: int,
+    *,
+    private: bool = False,
+    prefix: str | None = None,
+) -> None:
+    ctx.clear_state()
+    ctx.update_data(access_chat_peer_id=chat_peer_id, access_chat_group_db_id=group_db_id)
+    text = prefix or f"Беседа доступа добавлена: {group_name}."
+    await _answer_flow(
+        ctx,
+        text
+        + "\n\nДублировать сообщения участников, которые прошли условия доступа, на стену VK-сообщества?",
+        private=private,
+        keyboard=kb.access_chat_wall_duplicate_kb(chat_peer_id, group_db_id),
+    )
+
+
+async def _validate_wall_duplicate_community(ctx: Ctx, raw: str) -> tuple[int, str, str, str] | None:
+    group_ref, token = _extract_group_and_token(raw)
+    if not group_ref or not token:
+        await ctx.answer(
+            "Нужно отправить ссылку/ID сообщества и ключ доступа в одном сообщении.\n\n"
+            "Пример: https://vk.com/club123456 token=vk1.a.xxxxx"
+        )
+        return None
+    try:
+        group = await ctx.api.resolve_group(group_ref)
+        if isinstance(ctx.api, VKApi):
+            group_api = VKApi(token, group_id=group.id, api_version=ctx.api.api_version)
+            try:
+                await group_api.group_title(group.id)
+            finally:
+                await group_api.close()
+        return group.id, group.name, group.screen_name, token
+    except Exception:
+        logger.exception("Failed to resolve VK wall duplicate community or validate token")
+        await ctx.answer("Не смог проверить сообщество или токен. Проверьте ссылку, токен и права доступа к стене.")
+        return None
+
+
 async def _activate_free_subscription_access(ctx: Ctx, selected_group_ids: list[int]) -> None:
     advertiser_id = int(ctx.data["from_user"])
     ad_group_id = int(ctx.data["ad_group_id"])
@@ -307,14 +351,16 @@ async def _activate_free_subscription_access(ctx: Ctx, selected_group_ids: list[
         for partner_group_id in selected_group_ids:
             await partner_groups.add_need_groups(partner_group_id, ad_group_id)
 
-    ctx.clear_state()
-    await ctx.answer(
-        "Бесплатный доступ по подпискам включен. Беседа добавлена в подписочные условия выбранных площадок.",
-        keyboard=kb.advertiser_menu(),
-    )
     await send_log(
         ctx.api,
         f"Включен бесплатный доступ по подпискам для VK-беседы {ad_group_id}.",
+    )
+    await _ask_access_chat_wall_duplicate(
+        ctx,
+        ad_group_id,
+        str(ctx.data.get("ad_group_title") or ad_group_id),
+        0,
+        prefix="Бесплатный доступ по подпискам включен. Беседа добавлена в подписочные условия выбранных площадок.",
     )
 
 
@@ -337,14 +383,18 @@ async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
         group_name = await _save_chat_meta(ctx, chat_peer_id)
         if state == "partner_group_id":
             group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
-            ctx.clear_state()
-            await _answer_private_safely(
-                ctx,
-                f"Беседа доступа добавлена: {group_name}.\n\n"
-                "Теперь выберите режим доступа: бесплатно по подпискам, платно по времени или платно по сообщениям.",
-            )
             if group:
-                await _show_partner_group_rates(ctx, int(group["id"]), private=True)
+                await _ask_access_chat_wall_duplicate(
+                    ctx,
+                    chat_peer_id,
+                    group_name,
+                    int(group["id"]),
+                    private=True,
+                    prefix=(
+                        f"Беседа доступа добавлена: {group_name}.\n\n"
+                        "Теперь выберите режим доступа: бесплатно по подпискам, платно по времени или платно по сообщениям."
+                    ),
+                )
             return True
 
         if state == "buy_group":
@@ -352,17 +402,20 @@ async def _maybe_complete_chat_binding(ctx: Ctx) -> bool:
             if setup_rate_type in {"time", "msg"}:
                 group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
                 group = await _set_access_chat_rate_type(chat_peer_id, setup_rate_type)
-                ctx.clear_state()
                 type_text = "по времени" if setup_rate_type == "time" else "по сообщениям"
-                await _answer_private_safely(
-                    ctx,
-                    f"Беседа доступа добавлена: {group_name}.\n\n"
-                    f"Режим доступа: {type_text}.\n"
-                    "Базовые тарифы уже применены. Админ может изменить их в управлении площадкой.",
-                    keyboard=kb.advertiser_menu(),
-                )
                 if group:
-                    await _show_partner_group_rates(ctx, int(group["id"]), private=True)
+                    await _ask_access_chat_wall_duplicate(
+                        ctx,
+                        chat_peer_id,
+                        group_name,
+                        int(group["id"]),
+                        private=True,
+                        prefix=(
+                            f"Беседа доступа добавлена: {group_name}.\n\n"
+                            f"Режим доступа: {type_text}.\n"
+                            "Базовые тарифы уже применены. Админ может изменить их в управлении площадкой."
+                        ),
+                    )
                 return True
             await _show_buy_group_partner_selector(ctx, chat_peer_id, group_name, private=True)
             return True
@@ -704,6 +757,46 @@ async def _check_and_grant_subscription(ctx: Ctx, main_group_id: int) -> bool:
     return True
 
 
+async def _duplicate_chat_message_to_wall(ctx: Ctx) -> None:
+    if not ctx.is_chat or (not ctx.text and not ctx.attachment):
+        return
+    async with VkGroups() as vk_groups:
+        duplicate = await vk_groups.get_wall_duplicate(ctx.peer_id)
+    if not duplicate:
+        return
+
+    wall_group_id = int(duplicate["wall_group_id"])
+    author = await _vk_user_mention(ctx.api, ctx.user_id)
+    wall_parts = []
+    if ctx.text:
+        wall_parts.append(ctx.text)
+    wall_parts.append(f"Автор: {author}")
+    if ctx.api.group_id:
+        wall_parts.append(f"Купить рекламу: https://vk.com/write-{abs(int(ctx.api.group_id))}?ref={wall_group_id}")
+    wall_text = "\n\n".join(wall_parts)
+
+    if not isinstance(ctx.api, VKApi) and hasattr(ctx.api, "wall_post"):
+        try:
+            await ctx.api.wall_post(wall_group_id, wall_text, attachments=ctx.attachment)
+        except Exception:
+            logger.exception("Failed to duplicate VK chat message to fake/test wall chat=%s wall=%s", ctx.peer_id, wall_group_id)
+        return
+
+    token = duplicate["token"]
+    if not token:
+        logger.warning("VK chat wall duplicate skipped because token is empty chat=%s wall=%s", ctx.peer_id, wall_group_id)
+        return
+
+    group_api = VKApi(token, group_id=wall_group_id, api_version=ctx.api.api_version)
+    try:
+        post_id = await group_api.wall_post(wall_group_id, wall_text, attachments=ctx.attachment)
+        logger.info("Duplicated VK chat message to wall chat=%s wall=%s post_id=%s", ctx.peer_id, wall_group_id, post_id)
+    except Exception:
+        logger.exception("Failed to duplicate VK chat message to wall chat=%s wall=%s", ctx.peer_id, wall_group_id)
+    finally:
+        await group_api.close()
+
+
 async def _chat_guard(ctx: Ctx) -> bool:
     partner_group = await _subscription_partner_group(ctx)
     if not partner_group:
@@ -730,6 +823,7 @@ async def _chat_guard(ctx: Ctx) -> bool:
     groups = await _subscription_groups(ctx, source_group_id)
     if not groups:
         await _consume_paid_message(partner_group, ctx.user_id)
+        await _duplicate_chat_message_to_wall(ctx)
         return True
 
     async with UsersSubs() as subs:
@@ -754,6 +848,7 @@ async def _chat_guard(ctx: Ctx) -> bool:
     async with UsersSubs() as subs:
         await subs.add_sub(ctx.user_id, source_group_id, "sub_msg")
     await _consume_paid_message(partner_group, ctx.user_id)
+    await _duplicate_chat_message_to_wall(ctx)
     return True
 
 
@@ -1137,16 +1232,19 @@ def register_handlers(app: VKBotApp) -> None:
         if setup_rate_type in {"time", "msg"}:
             group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
             group = await _set_access_chat_rate_type(chat_peer_id, setup_rate_type)
-            ctx.clear_state()
             type_text = "по времени" if setup_rate_type == "time" else "по сообщениям"
-            await ctx.answer(
-                f"Беседа доступа добавлена: {group_name}.\n\n"
-                f"Режим доступа: {type_text}.\n"
-                "Базовые тарифы уже применены. Админ может изменить их в управлении площадкой.",
-                keyboard=kb.advertiser_menu(),
-            )
             if group:
-                await _show_partner_group_rates(ctx, int(group["id"]))
+                await _ask_access_chat_wall_duplicate(
+                    ctx,
+                    chat_peer_id,
+                    group_name,
+                    int(group["id"]),
+                    prefix=(
+                        f"Беседа доступа добавлена: {group_name}.\n\n"
+                        f"Режим доступа: {type_text}.\n"
+                        "Базовые тарифы уже применены. Админ может изменить их в управлении площадкой."
+                    ),
+                )
             return
         await _show_buy_group_partner_selector(ctx, chat_peer_id, group_name)
 
@@ -1267,6 +1365,67 @@ def register_handlers(app: VKBotApp) -> None:
         await ctx.answer(texts.ADD_PARTNER_GROUP, keyboard=kb.back("menu_partner"))
         ctx.set_state("partner_group_id")
 
+    @app.command_prefix("access_chat_wall_duplicate.")
+    async def access_chat_wall_duplicate(ctx: Ctx) -> None:
+        action = ctx.cmd.split(".")[-1]
+        chat_peer_id = int(ctx.payload.get("chat_peer_id") or ctx.data.get("access_chat_peer_id") or 0)
+        group_db_id = int(ctx.payload.get("group_id") if "group_id" in ctx.payload else ctx.data.get("access_chat_group_db_id") or 0)
+        if not chat_peer_id:
+            ctx.clear_state()
+            await ctx.answer("Не нашел беседу доступа. Откройте площадку заново и повторите настройку.")
+            return
+
+        ctx.update_data(access_chat_peer_id=chat_peer_id, access_chat_group_db_id=group_db_id)
+        if action == "no":
+            async with VkGroups() as vk_groups:
+                await vk_groups.set_wall_duplicate(chat_peer_id, None, False)
+            ctx.clear_state()
+            await ctx.answer("Дублирование сообщений на стену выключено.", keyboard=kb.advertiser_menu() if not group_db_id else None)
+            if group_db_id:
+                await _show_partner_group_rates(ctx, group_db_id)
+            return
+        if action != "yes":
+            await ctx.answer("Неверный вариант.")
+            return
+
+        await ctx.answer(
+            "Отправьте ссылку или ID VK-сообщества и ключ доступа в одном сообщении.\n\n"
+            "Пример: https://vk.com/club123456 token=vk1.a.xxxxx\n\n"
+            "Ключ должен принадлежать этому сообществу и иметь права на публикацию на стене."
+        )
+        ctx.set_state("access_chat_wall_duplicate_token")
+
+    @app.state_handler("access_chat_wall_duplicate_token")
+    async def access_chat_wall_duplicate_token(ctx: Ctx) -> None:
+        chat_peer_id = int(ctx.data.get("access_chat_peer_id") or 0)
+        group_db_id = int(ctx.data.get("access_chat_group_db_id") or 0)
+        if not chat_peer_id:
+            ctx.clear_state()
+            await ctx.answer("Не нашел беседу доступа. Откройте площадку заново и повторите настройку.")
+            return
+
+        community = await _validate_wall_duplicate_community(ctx, ctx.text)
+        if not community:
+            return
+        wall_group_id, group_name, screen_name, token = community
+        async with VkGroups() as vk_groups:
+            await vk_groups.upsert(
+                wall_group_id,
+                title=group_name,
+                screen_name=screen_name,
+                token=token,
+                target_type="community",
+                can_wall_post=True,
+            )
+            await vk_groups.set_wall_duplicate(chat_peer_id, wall_group_id, True)
+        ctx.clear_state()
+        await ctx.answer(
+            f"Дублирование включено. Сообщения из беседы будут публиковаться на стене {group_name}.",
+            keyboard=kb.advertiser_menu() if not group_db_id else None,
+        )
+        if group_db_id:
+            await _show_partner_group_rates(ctx, group_db_id)
+
     @app.state_handler("partner_group_id")
     async def partner_group_id_state(ctx: Ctx) -> None:
         chat_peer_id = _parse_vk_chat_peer_id(ctx.text)
@@ -1281,13 +1440,17 @@ def register_handlers(app: VKBotApp) -> None:
                 return
 
             group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
-            ctx.clear_state()
-            await ctx.answer(
-                f"Беседа доступа добавлена: {group_name}.\n\n"
-                "Теперь выберите режим доступа: бесплатно по подпискам, платно по времени или платно по сообщениям."
-            )
             if group:
-                await _show_partner_group_rates(ctx, int(group["id"]))
+                await _ask_access_chat_wall_duplicate(
+                    ctx,
+                    chat_peer_id,
+                    group_name,
+                    int(group["id"]),
+                    prefix=(
+                        f"Беседа доступа добавлена: {group_name}.\n\n"
+                        "Теперь выберите режим доступа: бесплатно по подпискам, платно по времени или платно по сообщениям."
+                    ),
+                )
             return
 
         group_ref, token = _extract_group_and_token(ctx.text)
