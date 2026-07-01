@@ -19,14 +19,31 @@ class Newsletters(Database):
     def __init__(self):
         super().__init__()
 
-    async def add(self, creator_id: int, text: str, target: NewslettersTarget, expires_at: Optional[date] = None, file_id: str = None, file_format: Literal["video", "photo"] = None):
+    async def add(
+        self,
+        creator_id: int,
+        text: str,
+        target: NewslettersTarget,
+        expires_at: Optional[date] = None,
+        file_id: str = None,
+        file_format: Literal["video", "photo"] = None,
+        button_text: str | None = None,
+        button_url: str | None = None,
+    ):
         await self.connect()
 
         is_moderating = True if expires_at else None
 
         await self.execute(
-            "INSERT INTO newsletters(creator_id, text, target, expires_at, is_moderating, file_id) VALUES ($1, $2, $3, $4, $5, $6);",
-            creator_id, text, int(target), expires_at, is_moderating, (file_id if file_id and file_id.startswith(("photo", "video", "doc")) else (file_format + file_id) if file_format else None)
+            "INSERT INTO newsletters(creator_id, text, target, expires_at, is_moderating, file_id, button_text, button_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);",
+            creator_id,
+            text,
+            int(target),
+            expires_at,
+            is_moderating,
+            (file_id if file_id and file_id.startswith(("photo", "video", "doc")) else (file_format + file_id) if file_format else None),
+            button_text,
+            button_url,
         )
 
         return self

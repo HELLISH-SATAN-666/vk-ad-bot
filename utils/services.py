@@ -203,14 +203,22 @@ async def send_newsletter(
     creator_id: int,
     text: str,
     attachment: Optional[str] = None,
+    button_text: Optional[str] = None,
+    button_url: Optional[str] = None,
     save_to_db: bool = True,
 ) -> int:
     if save_to_db:
         async with Newsletters() as newsletters:
-            await newsletters.add(creator_id, text, NewslettersTarget[target.upper()])
+            await newsletters.add(
+                creator_id,
+                text,
+                NewslettersTarget[target.upper()],
+                button_text=button_text,
+                button_url=button_url,
+            )
 
     success = 0
-    keyboard = kb.main_bot_link(api.group_id) if getattr(api, "group_id", None) else None
+    keyboard = kb.newsletter_button_link(api.group_id, button_text, button_url) if getattr(api, "group_id", None) else None
     for peer_id in target_ids:
         try:
             await api.send_message(peer_id, text, keyboard=keyboard, attachment=attachment)
@@ -285,6 +293,8 @@ async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
                     get_msk_now().date() + timedelta(days=period),
                     file_id=attachment,
                     file_format=file_format,
+                    button_text=payment_state.get("newsletter_button_text"),
+                    button_url=payment_state.get("newsletter_button_url"),
                 )
             pay_type = PaymentTypes.NEWSLETTER
             message = "Рассылка добавлена бесплатно." if price <= 0 else "Оплата подтверждена."
@@ -361,6 +371,8 @@ async def check_for_nl_events(api: VKApi) -> None:
             nl["creator_id"],
             nl["text"],
             attachment=nl["file_id"],
+            button_text=nl["button_text"],
+            button_url=nl["button_url"],
             save_to_db=False,
         )
         await send_log(api, f"Рассылка отправлена: {success}/{len(target_ids)}")

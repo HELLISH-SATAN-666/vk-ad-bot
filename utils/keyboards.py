@@ -135,7 +135,7 @@ def admin_menu() -> str:
             [text_button("Реклама", "manage_all_ads", "primary")],
             [text_button("Группы партнеров", "manage_partner_groups_admin"), text_button("Заявки на вывод", "manage_requests")],
             [text_button("Ручные оплаты", "manual_payments"), text_button("Рассылка", "admin_newsletter")],
-            [text_button("Параметры", "admin_var_settings"), text_button("Подписки", "subs_stat_menu")],
+            [text_button("Параметры", "admin_var_settings"), text_button("Оплата", "payment_methods"), text_button("Подписки", "subs_stat_menu")],
             [text_button("Статистика", "statistics")],
             [text_button("Назад", "main_menu", "negative")],
         ]
@@ -327,6 +327,16 @@ def var_settings_kb(settings: dict[str, str]) -> str:
     return keyboard(rows)
 
 
+def payment_methods_admin_kb(enabled: set[str]) -> str:
+    return keyboard(
+        [
+            [text_button(("✓ " if "yoomoney" in enabled else "") + "ЮMoney", "payment_method_toggle.yoomoney", "primary")],
+            [text_button(("✓ " if "yookassa" in enabled else "") + "ЮKassa", "payment_method_toggle.yookassa", "primary")],
+            [text_button("Назад", "menu_adminpanel", "negative")],
+        ]
+    )
+
+
 def poster_admin_kb(poster_id: int, status: int) -> str:
     rows = []
     if status == 0:
@@ -429,7 +439,13 @@ def open_bot_link(bot_group_id: int, ref_group_id: int, label: str = "Купит
 
 
 def main_bot_link(bot_group_id: int, label: str = "Разместить объявление") -> str:
-    return keyboard([[link_button(label, f"https://vk.com/write-{abs(int(bot_group_id))}")]])
+    return newsletter_button_link(bot_group_id, label, None)
+
+
+def newsletter_button_link(bot_group_id: int, label: Optional[str] = None, link: Optional[str] = None) -> str:
+    button_label = (label or "Разместить объявление").strip()[:40] or "Разместить объявление"
+    button_link = (link or "").strip() or f"https://vk.com/write-{abs(int(bot_group_id))}"
+    return keyboard([[link_button(button_label, button_link)]])
 
 
 def subscription_check_kb(groups: list[tuple], main_group_id: int) -> str:

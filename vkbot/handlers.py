@@ -6,6 +6,7 @@ import re
 from datetime import date, time, timedelta
 from os import environ, getenv
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import set_key
 
@@ -33,7 +34,7 @@ from database.partner_groups import normalize_sub_rates
 from utils import keyboards as kb
 from utils import texts
 from utils.config import BASE_DIR, env_int, get_ad_categories, get_admins, get_regions, get_settings_var_names
-from utils.payment_gateway import PaymentGatewayError, check_payment, create_payment_options
+from utils.payment_gateway import PaymentGatewayError, check_payment, create_payment_options, payment_providers
 from utils.services import (
     activate_payment_state,
     add_counter,
@@ -126,6 +127,8 @@ def _payment_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
             state["newsletter_text"] = data["newsletter_text"]
             state["newsletter_attachment"] = data.get("newsletter_attachment")
             state["newsletter_target"] = data["newsletter_target"]
+            state["newsletter_button_text"] = data.get("newsletter_button_text")
+            state["newsletter_button_url"] = data.get("newsletter_button_url")
         case "sub_access":
             state["access_group_id"] = int(data["access_group_id"])
             state["access_rate_type"] = data["access_rate_type"]
@@ -1135,6 +1138,64 @@ def _parse_dd_mm_yyyy(raw_value: str) -> date | None:
         return None
 
 
+def _newsletter_button_text(raw_value: str) -> str | None:
+    value = (raw_value or "").strip()
+    if value.lower() in {"0", "-", "нет", "без кнопки", "по умолчанию", "дефолт"}:
+        return None
+    return value[:40] or None
+
+
+def _newsletter_button_url(raw_value: str) -> str | None:
+    value = (raw_value or "").strip()
+    if value.lower() in {"0", "-", "нет", "по умолчанию", "дефолт"}:
+        return None
+    if not re.match(r"^https?://", value, flags=re.I):
+        value = "https://" + value
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or "." not in parsed.netloc:
+        return ""
+    return value[:500]
+
+
+async def _admin_newsletter_target_ids(ctx: Ctx) -> list[int]:
+    target = ctx.data["newsletter_type"]
+    if target == "partners":
+        async with Partners() as partners:
+            return [partner["user_id"] for partner in await partners.get_all()]
+    if target == "subs":
+        async with Users() as users:
+            return [user["user_id"] for user in await users.get_users_by_status(UserStatus.NO_ROLE)]
+    if target == "sub":
+        return [int(ctx.data["newsletter_target_id"])]
+    async with Users() as users:
+        return [user["user_id"] for user in await users.get_users_by_status(UserStatus.ADVERTISER)]
+
+
+def _enabled_payment_methods() -> set[str]:
+    return {provider for provider in payment_providers() if provider in {"yoomoney", "yookassa"}}
+
+
+def _set_enabled_payment_methods(providers: set[str]) -> None:
+    ordered = [provider for provider in ("yoomoney", "yookassa") if provider in providers]
+    providers_value = ",".join(ordered)
+    main_value = ordered[0] if ordered else "manual"
+    env_path = str(BASE_DIR / ".env")
+    set_key(env_path, "PAYMENT_PROVIDERS", providers_value)
+    set_key(env_path, "MAIN_PAYMENT_TYPE", main_value)
+    environ["PAYMENT_PROVIDERS"] = providers_value
+    environ["MAIN_PAYMENT_TYPE"] = main_value
+
+
+def _payment_methods_text() -> str:
+    enabled = _enabled_payment_methods()
+    rows = ["Способы оплаты\n"]
+    rows.append(f"ЮMoney: {'включен' if 'yoomoney' in enabled else 'выключен'}")
+    rows.append(f"ЮKassa: {'включена' if 'yookassa' in enabled else 'выключена'}")
+    if not enabled:
+        rows.append("\nАвтоматическая оплата выключена, пользователи попадут в ручную проверку.")
+    return "\n".join(rows)
+
+
 async def _show_newsletter(ctx: Ctx, nl_id: int) -> None:
     async with Newsletters() as newsletters:
         nl = await newsletters.get_by_id(nl_id)
@@ -1143,11 +1204,15 @@ async def _show_newsletter(ctx: Ctx, nl_id: int) -> None:
         return
 
     send_time = nl["send_time"].strftime("%H:%M") if nl["send_time"] else "15:00"
+    button_text = nl["button_text"] or "Разместить объявление"
+    button_url = nl["button_url"] or f"https://vk.com/write-{ctx.api.group_id}"
     await ctx.answer(
         f"Рассылка #{nl['id']}\n"
         f"Автор: {nl['creator_id']}\n"
         f"До: {nl['expires_at'].strftime('%d.%m.%Y')}\n"
         f"Время публикации: {send_time} МСК\n\n"
+        f"Кнопка: {button_text}\n"
+        f"Ссылка: {button_url}\n\n"
         f"{nl['text']}",
         keyboard=kb.keyboard(
             [
@@ -1567,6 +1632,23 @@ def register_handlers(app: VKBotApp) -> None:
     async def ad_newsletter_target(ctx: Ctx) -> None:
         target = ctx.cmd.split(".")[-1]
         ctx.update_data(newsletter_target=target)
+        await ctx.answer("Введите текст кнопки под рассылкой. Отправьте 0, чтобы оставить «Разместить объявление».")
+        ctx.set_state("newsletter_button_text")
+
+    @app.state_handler("newsletter_button_text")
+    async def newsletter_button_text(ctx: Ctx) -> None:
+        button_text = _newsletter_button_text(ctx.text)
+        ctx.update_data(newsletter_button_text=button_text)
+        await ctx.answer("Введите ссылку для кнопки. Отправьте 0, чтобы кнопка вела в главного бота.")
+        ctx.set_state("newsletter_button_url")
+
+    @app.state_handler("newsletter_button_url")
+    async def newsletter_button_url(ctx: Ctx) -> None:
+        button_url = _newsletter_button_url(ctx.text)
+        if button_url == "":
+            await ctx.answer("Неверная ссылка. Пример: https://vk.com/write-7341037 или https://example.ru")
+            return
+        ctx.update_data(newsletter_button_url=button_url)
         await ctx.answer(texts.ADD_NEWSLETTER_SUCCESSFUL_TEXT)
         ctx.set_state("buy_ad_period")
 
@@ -2422,19 +2504,34 @@ def register_handlers(app: VKBotApp) -> None:
 
     @app.state_handler("admin_newsletter_text")
     async def admin_newsletter_text(ctx: Ctx) -> None:
+        ctx.update_data(admin_newsletter_text=ctx.text, admin_newsletter_attachment=ctx.attachment)
+        await ctx.answer("Введите текст кнопки под рассылкой. Отправьте 0, чтобы оставить «Разместить объявление».")
+        ctx.set_state("admin_newsletter_button_text")
+
+    @app.state_handler("admin_newsletter_button_text")
+    async def admin_newsletter_button_text(ctx: Ctx) -> None:
+        ctx.update_data(admin_newsletter_button_text=_newsletter_button_text(ctx.text))
+        await ctx.answer("Введите ссылку для кнопки. Отправьте 0, чтобы кнопка вела в главного бота.")
+        ctx.set_state("admin_newsletter_button_url")
+
+    @app.state_handler("admin_newsletter_button_url")
+    async def admin_newsletter_button_url(ctx: Ctx) -> None:
+        button_url = _newsletter_button_url(ctx.text)
+        if button_url == "":
+            await ctx.answer("Неверная ссылка. Пример: https://vk.com/write-7341037 или https://example.ru")
+            return
         target = ctx.data["newsletter_type"]
-        if target == "partners":
-            async with Partners() as partners:
-                target_ids = [partner["user_id"] for partner in await partners.get_all()]
-        elif target == "subs":
-            async with Users() as users:
-                target_ids = [user["user_id"] for user in await users.get_users_by_status(UserStatus.NO_ROLE)]
-        elif target == "sub":
-            target_ids = [int(ctx.data["newsletter_target_id"])]
-        else:
-            async with Users() as users:
-                target_ids = [user["user_id"] for user in await users.get_users_by_status(UserStatus.ADVERTISER)]
-        success = await send_newsletter(ctx.api, target_ids, target, ctx.user_id, ctx.text, attachment=ctx.attachment)
+        target_ids = await _admin_newsletter_target_ids(ctx)
+        success = await send_newsletter(
+            ctx.api,
+            target_ids,
+            target,
+            ctx.user_id,
+            ctx.data["admin_newsletter_text"],
+            attachment=ctx.data.get("admin_newsletter_attachment"),
+            button_text=ctx.data.get("admin_newsletter_button_text"),
+            button_url=button_url,
+        )
         await ctx.answer(texts.nl_results_text(len(target_ids), success, target), keyboard=kb.newsletter_type_kb())
         ctx.clear_state()
 
@@ -2667,6 +2764,29 @@ def register_handlers(app: VKBotApp) -> None:
         if not await _admin_required(ctx):
             return
         await ctx.answer(texts.var_settings_text(), keyboard=kb.var_settings_kb(get_settings_var_names()))
+
+    @app.command("payment_methods")
+    async def payment_methods(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        enabled = _enabled_payment_methods()
+        await ctx.answer(_payment_methods_text(), keyboard=kb.payment_methods_admin_kb(enabled))
+
+    @app.command_prefix("payment_method_toggle.")
+    async def payment_method_toggle(ctx: Ctx) -> None:
+        if not await _admin_required(ctx):
+            return
+        provider = ctx.cmd.split(".")[-1]
+        if provider not in {"yoomoney", "yookassa"}:
+            await ctx.answer("Неизвестный способ оплаты.", keyboard=kb.payment_methods_admin_kb(_enabled_payment_methods()))
+            return
+        enabled = _enabled_payment_methods()
+        if provider in enabled:
+            enabled.remove(provider)
+        else:
+            enabled.add(provider)
+        _set_enabled_payment_methods(enabled)
+        await ctx.answer("Настройки оплаты обновлены.\n\n" + _payment_methods_text(), keyboard=kb.payment_methods_admin_kb(enabled))
 
     @app.command("change_var_value")
     async def change_var_value(ctx: Ctx) -> None:

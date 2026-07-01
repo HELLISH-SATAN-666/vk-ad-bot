@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS newsletters (
     target SMALLINT,
     send_time TIME WITHOUT TIME ZONE,
     is_moderating BOOLEAN,
-    file_id TEXT
+    file_id TEXT,
+    button_text TEXT,
+    button_url TEXT
 );
 
 CREATE TABLE IF NOT EXISTS partner_groups (
@@ -127,6 +129,12 @@ ADD COLUMN IF NOT EXISTS sub_rate_type TEXT DEFAULT 'none' NOT NULL;
 
 ALTER TABLE partner_groups
 ADD COLUMN IF NOT EXISTS sub_rates JSONB DEFAULT '{"msg":[{"msg":3,"price_rub":20},{"msg":8,"price_rub":40},{"msg":16,"price_rub":120},{"msg":28,"price_rub":180},{"msg":120,"price_rub":500}],"time":[{"days":7,"price_rub":20},{"days":30,"price_rub":50},{"days":90,"price_rub":120},{"days":180,"price_rub":200},{"days":365,"price_rub":300}],"none":[]}'::jsonb NOT NULL;
+
+ALTER TABLE newsletters
+ADD COLUMN IF NOT EXISTS button_text TEXT;
+
+ALTER TABLE newsletters
+ADD COLUMN IF NOT EXISTS button_url TEXT;
 
 UPDATE partner_groups
 SET sub_rate_type = 'none'

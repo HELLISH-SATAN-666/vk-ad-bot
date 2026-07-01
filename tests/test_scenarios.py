@@ -248,6 +248,7 @@ async def main() -> None:
     os.environ["DB_NAME"] = "vk_ad_bot_test"
     os.environ["ADMINS"] = "1113916884"
     os.environ["MAIN_PAYMENT_TYPE"] = "manual"
+    os.environ["PAYMENT_PROVIDERS"] = ""
     await recreate_test_db()
 
     api = FakeVKApi()
@@ -1097,6 +1098,8 @@ async def main() -> None:
     await send(app, advertiser_id, cmd="buy_ad.newsletter")
     await send(app, advertiser_id, "Тестовая рассылка")
     await send(app, advertiser_id, cmd="ad_newsletter_target.partners")
+    await send(app, advertiser_id, "Открыть форму")
+    await send(app, advertiser_id, "https://example.ru/ad-form")
     await send(app, advertiser_id, "1")
     await send(app, advertiser_id, "Оплата тестовой рассылки")
     pay_id = await first_manual_payment_id()
@@ -1134,8 +1137,8 @@ async def main() -> None:
     assert scheduled_newsletters
     scheduled_nl_kb = json.loads(scheduled_newsletters[0]["keyboard"])
     assert scheduled_nl_kb["buttons"][0][0]["action"]["type"] == "open_link"
-    assert scheduled_nl_kb["buttons"][0][0]["action"]["label"] == "Разместить объявление"
-    assert scheduled_nl_kb["buttons"][0][0]["action"]["link"] == f"https://vk.com/write-{api.group_id}"
+    assert scheduled_nl_kb["buttons"][0][0]["action"]["label"] == "Открыть форму"
+    assert scheduled_nl_kb["buttons"][0][0]["action"]["link"] == "https://example.ru/ad-form"
     assert any(
         item.get("peer_id") == partner_id and item.get("message") == "Тестовая рассылка"
         for item in api.sent[sent_before:]
@@ -1148,6 +1151,8 @@ async def main() -> None:
     await send(app, advertiser_id, cmd="buy_ad.newsletter")
     await send(app, advertiser_id, "Рассылка на удаление")
     await send(app, advertiser_id, cmd="ad_newsletter_target.subs")
+    await send(app, advertiser_id, "0")
+    await send(app, advertiser_id, "0")
     await send(app, advertiser_id, "1")
     await send(app, advertiser_id, "Оплата удаляемой рассылки")
     pay_id = await first_manual_payment_id()
@@ -1165,13 +1170,17 @@ async def main() -> None:
     await send(app, admin_id, cmd="admin_newsletter")
     await send(app, admin_id, cmd="answer_newsletter_to.partners")
     await send(app, admin_id, "Админская рассылка партнерам")
+    await send(app, admin_id, "Связаться")
+    await send(app, admin_id, "vk.com/write-239792902")
     admin_partner_nls = [
         item
         for item in api.sent
         if item.get("peer_id") == partner_id and item.get("message") == "Админская рассылка партнерам"
     ]
     assert admin_partner_nls
-    assert "Разместить объявление" in (admin_partner_nls[-1].get("keyboard") or "")
+    admin_partner_kb = json.loads(admin_partner_nls[-1]["keyboard"])
+    assert admin_partner_kb["buttons"][0][0]["action"]["label"] == "Связаться"
+    assert admin_partner_kb["buttons"][0][0]["action"]["link"] == "https://vk.com/write-239792902"
     assert any(
         item.get("peer_id") == partner_id and item.get("message") == "Админская рассылка партнерам"
         for item in api.sent
@@ -1184,6 +1193,8 @@ async def main() -> None:
     await send(app, admin_id, cmd="answer_newsletter_to.sub")
     await send(app, admin_id, cmd="select_newsletter_user", item_id=subscriber_id)
     await send(app, admin_id, "Личная рассылка подписчику")
+    await send(app, admin_id, "0")
+    await send(app, admin_id, "0")
     assert any(
         item.get("peer_id") == subscriber_id and item.get("message") == "Личная рассылка подписчику"
         for item in api.sent
@@ -1209,6 +1220,25 @@ async def main() -> None:
     await send(app, admin_id, cmd="subs_stat_menu")
     await send(app, admin_id, cmd="settings_plains")
     await send(app, admin_id, cmd="admin_var_settings")
+    payment_method_updates = []
+    original_set_payment_methods = vk_handlers._set_enabled_payment_methods
+
+    def fake_set_payment_methods(providers: set[str]) -> None:
+        payment_method_updates.append(set(providers))
+        os.environ["PAYMENT_PROVIDERS"] = ",".join(provider for provider in ("yoomoney", "yookassa") if provider in providers)
+
+    try:
+        os.environ["PAYMENT_PROVIDERS"] = "yoomoney"
+        vk_handlers._set_enabled_payment_methods = fake_set_payment_methods
+        await send(app, admin_id, cmd="payment_methods")
+        assert "ЮMoney: включен" in api.sent[-1]["message"]
+        assert "ЮKassa: выключена" in api.sent[-1]["message"]
+        await send(app, admin_id, cmd="payment_method_toggle.yookassa")
+        assert payment_method_updates[-1] == {"yoomoney", "yookassa"}
+        assert "ЮKassa: включена" in api.sent[-1]["message"]
+    finally:
+        vk_handlers._set_enabled_payment_methods = original_set_payment_methods
+        os.environ["PAYMENT_PROVIDERS"] = ""
     await send(app, advertiser_id, cmd="my_ads")
 
     async with Partners() as partners:

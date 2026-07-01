@@ -344,6 +344,12 @@ def _short_text(value: str, limit: int = 700) -> str:
     return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
+def _newsletter_button_summary(nl: Record) -> str:
+    label = nl["button_text"] or "Разместить объявление"
+    url = nl["button_url"] or "главный бот"
+    return f"Кнопка: {label} -> {url}"
+
+
 async def _vk_user_label(api, user_id: int) -> str:
     try:
         name = await api.get_user_name(int(user_id))
@@ -368,6 +374,7 @@ def admin_nl_text(nls: list[Record]) -> str:
         created = nl["creation_time"].strftime("%d.%m.%Y %H:%M") if nl["creation_time"] else "-"
         target = target_names.get(int(nl["target"]), str(nl["target"]))
         rows.append(f"Рассылка #{nl['id']} {target} ({created})")
+        rows.append(_newsletter_button_summary(nl))
         rows.append(_short_text(nl["text"], 500))
         rows.append("")
     return "\n".join(rows).strip()
@@ -398,6 +405,7 @@ async def advert_nl_text(api, nls: list[Record], current_nl_id: int) -> str:
         f"Дата покупки: {created}\n"
         f"Дата окончания: {expires_at}\n"
         f"Время публикации: {send_at.strftime('%H:%M')} МСК\n\n"
+        f"{_newsletter_button_summary(current_nl)}\n\n"
         f"Текст:\n{_short_text(current_nl['text'], 1200)}"
     )
 
