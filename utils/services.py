@@ -210,9 +210,10 @@ async def send_newsletter(
             await newsletters.add(creator_id, text, NewslettersTarget[target.upper()])
 
     success = 0
+    keyboard = kb.main_bot_link(api.group_id) if getattr(api, "group_id", None) else None
     for peer_id in target_ids:
         try:
-            await api.send_message(peer_id, text, attachment=attachment)
+            await api.send_message(peer_id, text, keyboard=keyboard, attachment=attachment)
             success += 1
         except Exception:
             logger.exception("Failed to send newsletter to peer %s", peer_id)

@@ -147,6 +147,17 @@ def automated_payment_instruction(price: int, provider: str) -> str:
     )
 
 
+def payment_options_instruction(price: int, providers: list[str]) -> str:
+    provider_names = {"yoomoney": "ЮMoney", "yookassa": "ЮKassa"}
+    names = [provider_names.get(provider, provider) for provider in providers]
+    joined = ", ".join(names) if names else "автоматическую оплату"
+    return (
+        f"К оплате: {price} ₽.\n\n"
+        f"Выберите удобный способ оплаты: {joined}.\n"
+        "После оплаты нажмите «Проверить оплату». Если автоматическая проверка не пройдет, можно отправить платеж на ручную проверку."
+    )
+
+
 def manual_payment_instruction(price: int) -> str:
     return (
         f"К оплате: {price} ₽.\n\n"

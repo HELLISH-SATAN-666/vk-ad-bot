@@ -375,13 +375,29 @@ def manual_payment_kb(pay_id: int) -> str:
 
 
 def payment_confirmation_kb(pay_url: str, back_cmd: str = "menu_advertiser") -> str:
-    return keyboard(
+    return payment_options_kb([{"provider": "", "pay_url": pay_url}], back_cmd)
+
+
+def payment_options_kb(payments: Iterable[dict], back_cmd: str = "menu_advertiser") -> str:
+    provider_names = {"yoomoney": "ЮMoney", "yookassa": "ЮKassa"}
+    rows = []
+    for payment in payments:
+        pay_url = str(payment.get("pay_url") or "")
+        if not pay_url:
+            continue
+        provider = str(payment.get("provider") or "")
+        suffix = provider_names.get(provider, provider)
+        label = f"Оплатить {suffix}" if suffix else "Оплатить"
+        rows.append([link_button(label, pay_url)])
+    rows.extend(
         [
-            [link_button("Оплатить", pay_url)],
             [text_button("Проверить оплату", "check_pay", "positive")],
             [text_button("Ручная проверка", "manual_pay_flow")],
             [text_button("Назад", back_cmd, "negative")],
         ]
+    )
+    return keyboard(
+        rows
     )
 
 
@@ -410,6 +426,10 @@ def newsletter_type_kb() -> str:
 def open_bot_link(bot_group_id: int, ref_group_id: int, label: str = "Купить рекламу") -> str:
     link = f"https://vk.com/write-{bot_group_id}?ref={ref_group_id}"
     return keyboard([[link_button(label, link)]])
+
+
+def main_bot_link(bot_group_id: int, label: str = "Разместить объявление") -> str:
+    return keyboard([[link_button(label, f"https://vk.com/write-{abs(int(bot_group_id))}")]])
 
 
 def subscription_check_kb(groups: list[tuple], main_group_id: int) -> str:

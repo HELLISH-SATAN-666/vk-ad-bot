@@ -33,7 +33,7 @@ from database.partner_groups import normalize_sub_rates
 from utils import keyboards as kb
 from utils import texts
 from utils.config import BASE_DIR, env_int, get_ad_categories, get_admins, get_regions, get_settings_var_names
-from utils.payment_gateway import PaymentGatewayError, check_payment, create_payment
+from utils.payment_gateway import PaymentGatewayError, check_payment, create_payment_options
 from utils.services import (
     activate_payment_state,
     add_counter,
@@ -143,7 +143,7 @@ async def _start_payment_flow(ctx: Ctx, price: int, description: str, *, back_cm
         return
 
     try:
-        payment = await create_payment(
+        payments = await create_payment_options(
             price,
             description,
             metadata={
@@ -155,9 +155,9 @@ async def _start_payment_flow(ctx: Ctx, price: int, description: str, *, back_cm
         )
     except PaymentGatewayError:
         logger.exception("Automated payment creation failed; falling back to manual payment")
-        payment = None
+        payments = []
 
-    if payment is None:
+    if not payments:
         current_pay_info = dict(ctx.data.get("current_pay_info") or {})
         current_pay_info.update({"sum": price})
         ctx.update_data(current_pay_info=current_pay_info)
@@ -165,17 +165,27 @@ async def _start_payment_flow(ctx: Ctx, price: int, description: str, *, back_cm
         ctx.set_state("pay_details")
         return
 
+    payment_items = [
+        {
+            "provider": payment.provider,
+            "label": payment.label,
+            "pay_url": payment.pay_url,
+        }
+        for payment in payments
+    ]
     ctx.update_data(
         current_pay_info={
             "sum": price,
-            "label": payment.label,
-            "provider": payment.provider,
-            "pay_url": payment.pay_url,
+            "label": payments[0].label,
+            "provider": payments[0].provider,
+            "pay_url": payments[0].pay_url,
+            "payments": payment_items,
+            "back_cmd": back_cmd,
         }
     )
     await ctx.answer(
-        texts.automated_payment_instruction(price, payment.provider),
-        keyboard=kb.payment_confirmation_kb(payment.pay_url, back_cmd),
+        texts.payment_options_instruction(price, [payment.provider for payment in payments]),
+        keyboard=kb.payment_options_kb(payment_items, back_cmd),
     )
     ctx.set_state(None)
 
@@ -1241,42 +1251,67 @@ def register_handlers(app: VKBotApp) -> None:
     @app.command("check_pay")
     async def check_pay(ctx: Ctx) -> None:
         pay_info = ctx.data.get("current_pay_info") or {}
-        provider = str(pay_info.get("provider") or "")
-        label = str(pay_info.get("label") or "")
-        if not provider or not label:
+        attempts = [
+            {
+                "provider": str(item.get("provider") or ""),
+                "label": str(item.get("label") or ""),
+                "pay_url": str(item.get("pay_url") or ""),
+            }
+            for item in (pay_info.get("payments") or [])
+            if isinstance(item, dict)
+        ]
+        if not attempts and pay_info.get("provider") and pay_info.get("label"):
+            attempts = [
+                {
+                    "provider": str(pay_info.get("provider") or ""),
+                    "label": str(pay_info.get("label") or ""),
+                    "pay_url": str(pay_info.get("pay_url") or ""),
+                }
+            ]
+        attempts = [item for item in attempts if item["provider"] and item["label"]]
+        back_cmd = str(pay_info.get("back_cmd") or "menu_advertiser")
+        if not attempts:
             await ctx.answer("Не нашел активный автоматический платеж. Можно начать покупку заново или отправить платеж на ручную проверку.")
             return
-        try:
-            payment_check = await check_payment(provider, label)
-        except PaymentGatewayError:
-            logger.exception("Failed to check payment provider=%s label=%s", provider, label)
+        checks = []
+        for attempt in attempts:
+            provider = attempt["provider"]
+            label = attempt["label"]
+            try:
+                payment_check = await check_payment(provider, label)
+            except PaymentGatewayError:
+                logger.exception("Failed to check payment provider=%s label=%s", provider, label)
+                continue
+            if payment_check.is_succeeded:
+                await activate_payment_state(ctx.api, _payment_state_from_data(ctx.data))
+                ctx.clear_state()
+                return
+            checks.append(payment_check)
+
+        if not checks:
             await ctx.answer(
                 "Не смог проверить платеж автоматически. Отправьте комментарий к платежу или скриншот, админ проверит вручную.",
                 keyboard=kb.keyboard([[kb.text_button("Ручная проверка", "manual_pay_flow", "primary")]]),
             )
             return
-        if not payment_check.is_succeeded:
-            pay_url = str(pay_info.get("pay_url") or "")
-            if payment_check.status == "canceled":
-                await ctx.answer(
-                    "Платеж отменен или истек. Начните покупку заново или отправьте оплату на ручную проверку.",
-                    keyboard=kb.keyboard([[kb.text_button("Ручная проверка", "manual_pay_flow", "primary")]]),
-                )
-                return
-            if payment_check.status == "waiting_for_capture":
-                await ctx.answer(
-                    "Платеж авторизован, но ЮKassa еще не завершила списание. Подождите минуту и нажмите проверку еще раз.",
-                    keyboard=kb.payment_confirmation_kb(pay_url, "menu_advertiser") if pay_url else None,
-                )
-                return
+
+        keyboard = kb.payment_options_kb(attempts, back_cmd)
+        if all(check.status == "canceled" for check in checks):
             await ctx.answer(
-                "Платеж пока не найден. Если вы уже оплатили, подождите минуту и нажмите проверку еще раз.",
-                keyboard=kb.payment_confirmation_kb(pay_url, "menu_advertiser") if pay_url else None,
+                "Платежи отменены или истекли. Начните покупку заново или отправьте оплату на ручную проверку.",
+                keyboard=kb.keyboard([[kb.text_button("Ручная проверка", "manual_pay_flow", "primary")]]),
             )
             return
-
-        await activate_payment_state(ctx.api, _payment_state_from_data(ctx.data))
-        ctx.clear_state()
+        if any(check.status == "waiting_for_capture" for check in checks):
+            await ctx.answer(
+                "Платеж авторизован, но ЮKassa еще не завершила списание. Подождите минуту и нажмите проверку еще раз.",
+                keyboard=keyboard,
+            )
+            return
+        await ctx.answer(
+            "Платеж пока не найден. Если вы уже оплатили, подождите минуту и нажмите проверку еще раз.",
+            keyboard=keyboard,
+        )
 
     @app.command("manual_pay_flow")
     async def manual_pay_flow(ctx: Ctx) -> None:

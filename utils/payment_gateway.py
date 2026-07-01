@@ -43,14 +43,54 @@ def payment_provider() -> str:
     return (getenv("MAIN_PAYMENT_TYPE") or "manual").strip().lower()
 
 
+def payment_providers() -> list[str]:
+    raw = getenv("PAYMENT_PROVIDERS") or getenv("MAIN_PAYMENT_TYPE") or "manual"
+    providers = []
+    for value in raw.replace("+", ",").replace(";", ",").replace(" ", ",").split(","):
+        provider = value.strip().lower()
+        if provider in {"", "manual", "none", "off", "false", "0"}:
+            continue
+        if provider not in providers:
+            providers.append(provider)
+    return providers
+
+
 def is_manual_payment_mode() -> bool:
-    return payment_provider() in {"", "manual", "none", "off", "false", "0"}
+    return not payment_providers()
 
 
 async def create_payment(amount: int, description: str, metadata: dict[str, Any] | None = None, return_url: str | None = None) -> PaymentAttempt | None:
-    provider = payment_provider()
-    if provider in {"", "manual", "none", "off", "false", "0"}:
+    providers = payment_providers()
+    if not providers:
         return None
+    return await create_payment_for_provider(providers[0], amount, description, metadata=metadata, return_url=return_url)
+
+
+async def create_payment_options(amount: int, description: str, metadata: dict[str, Any] | None = None, return_url: str | None = None) -> list[PaymentAttempt]:
+    providers = payment_providers()
+    if not providers:
+        return []
+    payments = []
+    errors = []
+    for provider in providers:
+        try:
+            payments.append(await create_payment_for_provider(provider, amount, description, metadata=metadata, return_url=return_url))
+        except PaymentGatewayError as exc:
+            logger.exception("Failed to create %s payment", provider)
+            errors.append(exc)
+    if not payments and errors:
+        raise PaymentGatewayError("Failed to create any configured payment")
+    return payments
+
+
+async def create_payment_for_provider(
+    provider: str,
+    amount: int,
+    description: str,
+    metadata: dict[str, Any] | None = None,
+    return_url: str | None = None,
+) -> PaymentAttempt:
+    provider = provider.strip().lower()
     if amount <= 0:
         raise PaymentGatewayError("Payment amount must be positive")
     if provider == "yoomoney":

@@ -274,19 +274,23 @@ async def main() -> None:
     assert await vk_handlers._resolve_chat_title(fallback_ctx, fallback_peer_id) == "Chat 9999"
 
     class StubPayment:
-        provider = "yoomoney"
-        label = "stub-label"
-        pay_url = "https://pay.example/stub"
+        def __init__(self, provider: str, label: str, pay_url: str):
+            self.provider = provider
+            self.label = label
+            self.pay_url = pay_url
 
-    async def fake_create_payment(amount: int, description: str, **kwargs):
+    async def fake_create_payment_options(amount: int, description: str, **kwargs):
         assert amount == 123
         assert "stub" in description
         assert kwargs["metadata"]["from_user"] == 222000000
-        return StubPayment()
+        return [
+            StubPayment("yoomoney", "stub-label-yoomoney", "https://pay.example/yoomoney"),
+            StubPayment("yookassa", "stub-label-yookassa", "https://pay.example/yookassa"),
+        ]
 
-    original_create_payment = vk_handlers.create_payment
+    original_create_payment_options = vk_handlers.create_payment_options
     try:
-        vk_handlers.create_payment = fake_create_payment
+        vk_handlers.create_payment_options = fake_create_payment_options
         payment_ctx = Ctx(
             api=api,  # type: ignore[arg-type]
             state=StateStore(),
@@ -301,16 +305,20 @@ async def main() -> None:
             },
         )
         await vk_handlers._start_payment_flow(payment_ctx, 123, "stub payment")
-        assert payment_ctx.data["current_pay_info"]["label"] == "stub-label"
-        assert "check_pay" in (api.sent[-1].get("keyboard") or "")
+        assert payment_ctx.data["current_pay_info"]["label"] == "stub-label-yoomoney"
+        assert payment_ctx.data["current_pay_info"]["payments"][1]["provider"] == "yookassa"
+        payment_keyboard = api.sent[-1].get("keyboard") or ""
+        assert "Оплатить ЮMoney" in payment_keyboard
+        assert "Оплатить ЮKassa" in payment_keyboard
+        assert "check_pay" in payment_keyboard
     finally:
-        vk_handlers.create_payment = original_create_payment
+        vk_handlers.create_payment_options = original_create_payment_options
 
-    async def failing_create_payment(amount: int, description: str, **kwargs):
+    async def failing_create_payment_options(amount: int, description: str, **kwargs):
         raise PaymentGatewayError("provider unavailable")
 
     try:
-        vk_handlers.create_payment = failing_create_payment
+        vk_handlers.create_payment_options = failing_create_payment_options
         fallback_payment_ctx = Ctx(
             api=api,  # type: ignore[arg-type]
             state=StateStore(),
@@ -328,20 +336,20 @@ async def main() -> None:
         assert fallback_payment_ctx.data["current_pay_info"]["sum"] == 321
         assert fallback_payment_ctx.state.get_state(222000000) == "pay_details"
     finally:
-        vk_handlers.create_payment = original_create_payment
+        vk_handlers.create_payment_options = original_create_payment_options
 
     activated_states = []
 
     async def fake_activate_payment_state(api_arg, state):
         activated_states.append(state)
 
-    async def unexpected_create_payment(amount: int, description: str, **kwargs):
+    async def unexpected_create_payment_options(amount: int, description: str, **kwargs):
         raise AssertionError("admin purchase must not create external payment")
 
     original_activate_payment_state = vk_handlers.activate_payment_state
     try:
         vk_handlers.activate_payment_state = fake_activate_payment_state
-        vk_handlers.create_payment = unexpected_create_payment
+        vk_handlers.create_payment_options = unexpected_create_payment_options
         admin_payment_ctx = Ctx(
             api=api,  # type: ignore[arg-type]
             state=StateStore(),
@@ -367,7 +375,7 @@ async def main() -> None:
         assert activated_states and activated_states[0]["current_pay_info"]["sum"] == 0
     finally:
         vk_handlers.activate_payment_state = original_activate_payment_state
-        vk_handlers.create_payment = original_create_payment
+        vk_handlers.create_payment_options = original_create_payment_options
 
     admin_id = 1113916884
     partner_id = 222000001
@@ -1118,6 +1126,16 @@ async def main() -> None:
         await newsletters.update_send_time(nl_id, get_msk_now().time().replace(second=0, microsecond=0))
     sent_before = len(api.sent)
     await check_for_nl_events(api)  # type: ignore[arg-type]
+    scheduled_newsletters = [
+        item
+        for item in api.sent[sent_before:]
+        if item.get("peer_id") == partner_id and item.get("message") == "Тестовая рассылка"
+    ]
+    assert scheduled_newsletters
+    scheduled_nl_kb = json.loads(scheduled_newsletters[0]["keyboard"])
+    assert scheduled_nl_kb["buttons"][0][0]["action"]["type"] == "open_link"
+    assert scheduled_nl_kb["buttons"][0][0]["action"]["label"] == "Разместить объявление"
+    assert scheduled_nl_kb["buttons"][0][0]["action"]["link"] == f"https://vk.com/write-{api.group_id}"
     assert any(
         item.get("peer_id") == partner_id and item.get("message") == "Тестовая рассылка"
         for item in api.sent[sent_before:]
@@ -1147,6 +1165,13 @@ async def main() -> None:
     await send(app, admin_id, cmd="admin_newsletter")
     await send(app, admin_id, cmd="answer_newsletter_to.partners")
     await send(app, admin_id, "Админская рассылка партнерам")
+    admin_partner_nls = [
+        item
+        for item in api.sent
+        if item.get("peer_id") == partner_id and item.get("message") == "Админская рассылка партнерам"
+    ]
+    assert admin_partner_nls
+    assert "Разместить объявление" in (admin_partner_nls[-1].get("keyboard") or "")
     assert any(
         item.get("peer_id") == partner_id and item.get("message") == "Админская рассылка партнерам"
         for item in api.sent

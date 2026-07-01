@@ -68,8 +68,9 @@ https://vk.com/club123456 token=vk1.a.xxxxx
 4. админ подтверждает в разделе `Ручные оплаты`;
 5. реклама активируется или уходит на модерацию.
 
-Автопроверка YooMoney/YooKassa включается через `MAIN_PAYMENT_TYPE=yoomoney`
-или `MAIN_PAYMENT_TYPE=yookassa`. Если платежный провайдер недоступен или
+Автопроверка YooMoney/YooKassa включается через `MAIN_PAYMENT_TYPE=yoomoney`,
+`MAIN_PAYMENT_TYPE=yookassa` или `PAYMENT_PROVIDERS=yoomoney,yookassa`, если
+нужно показать клиенту оба способа оплаты одновременно. Если платежный провайдер недоступен или
 пользователь выбирает ручную проверку, бот возвращается к сценарию ручной заявки.
 Для YooMoney можно задать `YOOMONEY_RECEIVER`, иначе используется кошелек из
 старой Telegram-версии.
