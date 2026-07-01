@@ -86,7 +86,7 @@ def _create_yoomoney_payment(amount: int, description: str) -> PaymentAttempt:
             receiver=receiver,
             quickpay_form="shop",
             targets=description[:128],
-            paymentType=getenv("YOOMONEY_PAYMENT_TYPE") or "SB",
+            paymentType=getenv("YOOMONEY_PAYMENT_TYPE") or "AC",
             sum=amount,
             label=label,
         )
