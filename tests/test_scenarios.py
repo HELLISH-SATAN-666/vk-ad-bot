@@ -36,11 +36,12 @@ from database.base import close_pool
 from database.partner_groups import normalize_sub_rates
 from database.schema import ensure_schema
 from utils.config import BASE_DIR, get_ad_categories
+from utils.payment_gateway import PaymentGatewayError, _confirmation_url, _yookassa_check_from_operation
 from utils.services import check_for_nl_events, check_for_poster_events, get_msk_now
 from vkbot.api import VKGroupInfo
 from vkbot.api import VKApi
 from vkbot.api import normalize_group_ref
-from vkbot.app import VKBotApp
+from vkbot.app import Ctx, StateStore, VKBotApp
 import vkbot.handlers as vk_handlers
 from vkbot.handlers import register_handlers
 
@@ -54,6 +55,8 @@ class FakeVKApi:
         self.members: dict[tuple[int, int], bool] = {}
         self.chat_titles: dict[int, str] = {}
         self.chat_members: dict[tuple[int, int], bool] = {}
+        self.fail_chat_title_peer_ids: set[int] = set()
+        self.fail_chat_member_peer_ids: set[int] = set()
 
     async def send_message(self, peer_id: int, message: str, keyboard=None, attachment=None, disable_mentions=True):
         self.sent.append(
@@ -81,9 +84,13 @@ class FakeVKApi:
         return self.groups.get(abs(group_id), VKGroupInfo(abs(group_id), "", f"Group {abs(group_id)}")).name
 
     async def chat_title(self, peer_id: int) -> str:
+        if int(peer_id) in self.fail_chat_title_peer_ids:
+            raise RuntimeError("chat title unavailable")
         return self.chat_titles.get(int(peer_id), f"Chat {int(peer_id) - 2_000_000_000}")
 
     async def is_chat_member(self, peer_id: int, user_id: int) -> bool:
+        if int(peer_id) in self.fail_chat_member_peer_ids:
+            raise RuntimeError("chat members unavailable")
         return self.chat_members.get((int(peer_id), int(user_id)), True)
 
     async def chat_invite_link(self, peer_id: int) -> str:
@@ -240,6 +247,7 @@ async def main() -> None:
     load_dotenv(BASE_DIR / ".env", override=True)
     os.environ["DB_NAME"] = "vk_ad_bot_test"
     os.environ["ADMINS"] = "1113916884"
+    os.environ["MAIN_PAYMENT_TYPE"] = "manual"
     await recreate_test_db()
 
     api = FakeVKApi()
@@ -247,6 +255,119 @@ async def main() -> None:
     assert vk_handlers.SUBSCRIPTION_PROMPT_TTL_SECONDS == 20
     vk_handlers.SUBSCRIPTION_PROMPT_TTL_SECONDS = 0
     register_handlers(app)
+
+    fallback_peer_id = 2_000_009_999
+    api.fail_chat_member_peer_ids.add(fallback_peer_id)
+    fallback_ctx = Ctx(
+        api=api,  # type: ignore[arg-type]
+        state=StateStore(),
+        update={},
+        message={
+            "from_id": 222000000,
+            "peer_id": 222000000,
+            "text": "",
+            "attachments": [],
+            "id": next_message_id(),
+            "conversation_message_id": next_message_id(),
+        },
+    )
+    assert await vk_handlers._resolve_chat_title(fallback_ctx, fallback_peer_id) == "Chat 9999"
+
+    class StubPayment:
+        provider = "yoomoney"
+        label = "stub-label"
+        pay_url = "https://pay.example/stub"
+
+    async def fake_create_payment(amount: int, description: str, **kwargs):
+        assert amount == 123
+        assert "stub" in description
+        assert kwargs["metadata"]["from_user"] == 222000000
+        return StubPayment()
+
+    original_create_payment = vk_handlers.create_payment
+    try:
+        vk_handlers.create_payment = fake_create_payment
+        payment_ctx = Ctx(
+            api=api,  # type: ignore[arg-type]
+            state=StateStore(),
+            update={},
+            message={
+                "from_id": 222000000,
+                "peer_id": 222000000,
+                "text": "",
+                "attachments": [],
+                "id": next_message_id(),
+                "conversation_message_id": next_message_id(),
+            },
+        )
+        await vk_handlers._start_payment_flow(payment_ctx, 123, "stub payment")
+        assert payment_ctx.data["current_pay_info"]["label"] == "stub-label"
+        assert "check_pay" in (api.sent[-1].get("keyboard") or "")
+    finally:
+        vk_handlers.create_payment = original_create_payment
+
+    async def failing_create_payment(amount: int, description: str, **kwargs):
+        raise PaymentGatewayError("provider unavailable")
+
+    try:
+        vk_handlers.create_payment = failing_create_payment
+        fallback_payment_ctx = Ctx(
+            api=api,  # type: ignore[arg-type]
+            state=StateStore(),
+            update={},
+            message={
+                "from_id": 222000000,
+                "peer_id": 222000000,
+                "text": "",
+                "attachments": [],
+                "id": next_message_id(),
+                "conversation_message_id": next_message_id(),
+            },
+        )
+        await vk_handlers._start_payment_flow(fallback_payment_ctx, 321, "fallback payment")
+        assert fallback_payment_ctx.data["current_pay_info"]["sum"] == 321
+        assert fallback_payment_ctx.state.get_state(222000000) == "pay_details"
+    finally:
+        vk_handlers.create_payment = original_create_payment
+
+    activated_states = []
+
+    async def fake_activate_payment_state(api_arg, state):
+        activated_states.append(state)
+
+    async def unexpected_create_payment(amount: int, description: str, **kwargs):
+        raise AssertionError("admin purchase must not create external payment")
+
+    original_activate_payment_state = vk_handlers.activate_payment_state
+    try:
+        vk_handlers.activate_payment_state = fake_activate_payment_state
+        vk_handlers.create_payment = unexpected_create_payment
+        admin_payment_ctx = Ctx(
+            api=api,  # type: ignore[arg-type]
+            state=StateStore(),
+            update={},
+            message={
+                "from_id": 1113916884,
+                "peer_id": 1113916884,
+                "text": "",
+                "attachments": [],
+                "id": next_message_id(),
+                "conversation_message_id": next_message_id(),
+            },
+        )
+        admin_payment_ctx.update_data(
+            ad_type="newsletter",
+            from_user=1113916884,
+            sub_period=1,
+            current_pay_info={"sum": 123},
+            newsletter_text="admin free newsletter",
+            newsletter_target="partners",
+        )
+        await vk_handlers._start_payment_flow(admin_payment_ctx, 123, "admin free")
+        assert activated_states and activated_states[0]["current_pay_info"]["sum"] == 0
+    finally:
+        vk_handlers.activate_payment_state = original_activate_payment_state
+        vk_handlers.create_payment = original_create_payment
 
     admin_id = 1113916884
     partner_id = 222000001
@@ -351,6 +472,12 @@ async def main() -> None:
     await send(app, advertiser_id, cmd="buy_ad.poster")
     await send(app, advertiser_id, f"{first_category}\nТестовое объявление")
     await send(app, advertiser_id, "0")
+    assert "Выберите VK-сообщества" in app.api.sent[-1]["message"]
+    assert "количество дней" not in app.api.sent[-1]["message"]
+    assert "[club3001|Group 3001]" in app.api.sent[-1]["message"]
+    await send(app, advertiser_id, cmd="select_group", num="1")
+    await send(app, advertiser_id, cmd="confirm_poster_target_groups")
+    assert "[club3001|Group 3001]" in app.api.sent[-1]["message"]
     await send(app, advertiser_id, "1")
     os.environ["ADMINS"] = ""
     os.environ["LOG_PEER_ID"] = "222000099"
@@ -375,6 +502,13 @@ async def main() -> None:
         assert all_posters[0]["creator_id"] == advertiser_id
         poster_id = all_posters[0]["id"]
         assert await posters.get_by_status(PosterStatus.MODERATED)
+    async with PartnerGroups() as partner_groups:
+        group = await partner_groups.get_by_db_id(partner_group_db_id)
+        assert poster_id in (group["show_ad_ids"] or [])
+
+    await send(app, admin_id, cmd="open_poster", item_id=poster_id)
+    assert "Выбранные сообщества" in app.api.sent[-1]["message"]
+    assert "[club3001|Group 3001]" in app.api.sent[-1]["message"]
 
     await send(app, admin_id, cmd="poster_change_button", poster_id=poster_id)
     await send(app, admin_id, "Новая кнопка")
@@ -388,7 +522,7 @@ async def main() -> None:
     await send(app, admin_id, cmd="confirm_poster_groups")
     async with PartnerGroups() as partner_groups:
         group = await partner_groups.get_by_db_id(partner_group_db_id)
-        assert poster_id in (group["show_ad_ids"] or [])
+        assert poster_id not in (group["show_ad_ids"] or [])
 
     await send(app, admin_id, cmd="poster_select_groups", poster_id=poster_id)
     wall_num = str((app.state.get_data(admin_id)["select_group_values"]).index(wall_group_id) + 1)
@@ -396,7 +530,7 @@ async def main() -> None:
     await send(app, admin_id, cmd="confirm_poster_groups")
     async with PartnerGroups() as partner_groups:
         group = await partner_groups.get_by_db_id(partner_group_db_id)
-        assert poster_id not in (group["show_ad_ids"] or [])
+        assert poster_id in (group["show_ad_ids"] or [])
 
     await send(app, admin_id, cmd="poster_act.activate", poster_id=poster_id)
     async with Posters() as posters:
@@ -409,7 +543,8 @@ async def main() -> None:
         assert (await posters.get_by_id(poster_id))["status"] == PosterStatus.FROZEN
 
     await send(app, admin_id, cmd="poster_schedule_send", poster_id=poster_id)
-    await send(app, admin_id, cmd="poster_schedule_group", num="1")
+    assert "Пост будет запланирован в выбранные клиентом сообщества" in app.api.sent[-1]["message"]
+    assert "[club3001|Group 3001]" in app.api.sent[-1]["message"]
     schedule_time = (get_msk_now() + timedelta(minutes=5)).strftime("%H:%M")
     await send(app, admin_id, schedule_time)
     async with Queue() as queue:
@@ -420,6 +555,8 @@ async def main() -> None:
     await send(app, reject_advertiser_id, cmd="buy_ad.poster")
     await send(app, reject_advertiser_id, f"{first_category}\nОтклоняемое объявление")
     await send(app, reject_advertiser_id, "0")
+    await send(app, reject_advertiser_id, cmd="select_group", num="1")
+    await send(app, reject_advertiser_id, cmd="confirm_poster_target_groups")
     await send(app, reject_advertiser_id, "1")
     await send(app, reject_advertiser_id, "Отклонить оплату")
     reject_pay_id = await first_manual_payment_id()
@@ -1101,6 +1238,14 @@ async def main() -> None:
     async with Users() as users:
         assert await users.in_db(partner_id)
         assert await users.in_db(advertiser_id)
+
+    yookassa_check = _yookassa_check_from_operation(
+        "payment-id",
+        {"status": "succeeded", "paid": True, "amount": {"value": "123.45", "currency": "RUB"}},
+    )
+    assert yookassa_check.is_succeeded
+    assert str(yookassa_check.amount) == "123.45"
+    assert _confirmation_url({"confirmation_url": "https://pay.example/ok"}) == "https://pay.example/ok"
 
     await close_pool()
     print("scenario tests ok")

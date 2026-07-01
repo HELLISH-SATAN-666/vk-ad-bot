@@ -33,6 +33,7 @@ from database.partner_groups import normalize_sub_rates
 from utils import keyboards as kb
 from utils import texts
 from utils.config import BASE_DIR, env_int, get_ad_categories, get_admins, get_regions, get_settings_var_names
+from utils.payment_gateway import PaymentGatewayError, check_payment, create_payment
 from utils.services import (
     activate_payment_state,
     add_counter,
@@ -97,6 +98,12 @@ async def _group_titles(api, group_ids: list[int]) -> dict[int, str]:
     return result
 
 
+async def _community_link(api, group_id: int) -> str:
+    title = await api.group_title(group_id)
+    safe_title = title.replace("|", " ").replace("]", ")").strip() or f"club{abs(int(group_id))}"
+    return f"[club{abs(int(group_id))}|{safe_title}]"
+
+
 def _payment_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
     state = {
         "ad_type": data["ad_type"],
@@ -108,6 +115,7 @@ def _payment_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
         case "poster":
             state["poster_info"] = data["poster_info"]
             state["region_codes"] = list(map(int, data["region_codes"]))
+            state["selected_group_ids"] = list(map(int, data.get("selected_group_ids") or []))
         case "group":
             state["ad_group_id"] = data["ad_group_id"]
             state["selected_group_ids"] = list(map(int, data.get("selected_group_ids") or []))
@@ -123,6 +131,53 @@ def _payment_state_from_data(data: dict[str, Any]) -> dict[str, Any]:
             state["access_rate_type"] = data["access_rate_type"]
             state["access_rate"] = data["access_rate"]
     return state
+
+
+async def _start_payment_flow(ctx: Ctx, price: int, description: str, *, back_cmd: str = "menu_advertiser") -> None:
+    if await _is_admin(ctx):
+        current_pay_info = dict(ctx.data.get("current_pay_info") or {})
+        current_pay_info.update({"sum": 0, "admin_free": True, "original_sum": price})
+        ctx.update_data(current_pay_info=current_pay_info)
+        await activate_payment_state(ctx.api, _payment_state_from_data(ctx.data))
+        ctx.clear_state()
+        return
+
+    try:
+        payment = await create_payment(
+            price,
+            description,
+            metadata={
+                "ad_type": ctx.data.get("ad_type"),
+                "from_user": ctx.user_id,
+                "period": ctx.data.get("sub_period"),
+                "selected_groups": ",".join(map(str, ctx.data.get("selected_group_ids") or [])),
+            },
+        )
+    except PaymentGatewayError:
+        logger.exception("Automated payment creation failed; falling back to manual payment")
+        payment = None
+
+    if payment is None:
+        current_pay_info = dict(ctx.data.get("current_pay_info") or {})
+        current_pay_info.update({"sum": price})
+        ctx.update_data(current_pay_info=current_pay_info)
+        await ctx.answer(texts.manual_payment_instruction(price))
+        ctx.set_state("pay_details")
+        return
+
+    ctx.update_data(
+        current_pay_info={
+            "sum": price,
+            "label": payment.label,
+            "provider": payment.provider,
+            "pay_url": payment.pay_url,
+        }
+    )
+    await ctx.answer(
+        texts.automated_payment_instruction(price, payment.provider),
+        keyboard=kb.payment_confirmation_kb(payment.pay_url, back_cmd),
+    )
+    ctx.set_state(None)
 
 
 def _split_group_refs(text: str) -> list[str]:
@@ -167,6 +222,39 @@ def _parse_vk_chat_peer_id(raw: str) -> int | None:
         return 2_000_000_000 + int(match.group(1))
 
     return None
+
+
+async def _resolve_chat_title(
+    ctx: Ctx,
+    chat_peer_id: int,
+    *,
+    require_user_member: bool = True,
+    access_error: str = "Не смог получить доступ к VK-беседе. Добавьте бота в беседу и повторите /id.",
+) -> str | None:
+    group_name = f"VK chat {chat_peer_id}"
+    try:
+        group_name = await ctx.api.chat_title(chat_peer_id)
+    except Exception as exc:
+        logger.info("Failed to resolve VK chat title for peer_id=%s: %s", chat_peer_id, exc)
+
+    if not require_user_member:
+        return group_name
+
+    try:
+        is_member = await ctx.api.is_chat_member(chat_peer_id, ctx.user_id)
+    except Exception as exc:
+        logger.info(
+            "Failed to verify VK chat membership user=%s peer_id=%s: %s; accepting valid peer_id with fallback metadata",
+            ctx.user_id,
+            chat_peer_id,
+            exc,
+        )
+        return group_name
+
+    if not is_member:
+        await ctx.answer(access_error)
+        return None
+    return group_name
 
 
 def _is_bot_invite_action(ctx: Ctx) -> bool:
@@ -258,6 +346,53 @@ async def _show_buy_group_partner_selector(ctx: Ctx, chat_peer_id: int, group_na
         "\n".join(text),
         private=private,
         keyboard=kb.number_select_kb(len(partner_group_ids), set(), "confirm_select_groups", "buy_ad"),
+    )
+    ctx.set_state(None)
+
+
+async def _show_poster_group_selector(ctx: Ctx) -> None:
+    poster_info = ctx.data.get("poster_info") or {}
+    region_codes = list(map(int, ctx.data.get("region_codes") or []))
+    if not poster_info or not region_codes:
+        await ctx.answer("Не нашел данные объявления. Начните покупку заново.", keyboard=kb.advertiser_menu())
+        ctx.clear_state()
+        return
+
+    poster_filter = {
+        "topic_id": int(poster_info["ad_topic_id"]),
+        "region_codes": region_codes,
+    }
+    groups = (await get_suitable_groups(poster_filter))["suitable_groups"]
+    if not groups:
+        await ctx.answer(
+            "Сейчас нет подключенных VK-сообществ со стеной, которые подходят под выбранную тематику и регион.",
+            keyboard=kb.advertiser_menu(),
+        )
+        ctx.clear_state()
+        return
+
+    values = [int(group["group_id"]) for group in groups]
+    text = [
+        "Выберите VK-сообщества для размещения объявления:",
+        "",
+    ]
+    for index, group in enumerate(groups, 1):
+        text.append(f"{index}) {await _community_link(ctx.api, int(group['group_id']))}")
+    text.extend(
+        [
+            "",
+            "Цена считается за каждое выбранное сообщество.",
+        ]
+    )
+    ctx.update_data(
+        select_group_values=values,
+        selected=set(),
+        select_confirm_cmd="confirm_poster_target_groups",
+        select_back_cmd="buy_ad",
+    )
+    await ctx.answer(
+        "\n".join(text),
+        keyboard=kb.number_select_kb(len(values), set(), "confirm_poster_target_groups", "buy_ad"),
     )
     ctx.set_state(None)
 
@@ -896,8 +1031,16 @@ async def _show_poster(ctx: Ctx, poster_id: int) -> None:
     if not poster:
         await ctx.answer("Объявление не найдено.", keyboard=kb.back("manage_ad_posts"))
         return
+    selected_groups = (await get_suitable_groups(poster))["selected_groups"]
+    if selected_groups:
+        community_lines = []
+        for group in selected_groups:
+            community_lines.append(f"- {await _community_link(ctx.api, int(group['group_id']))}")
+        communities_text = "\n".join(community_lines)
+    else:
+        communities_text = "- не выбраны"
     await ctx.answer(
-        texts.admin_poster_text(poster),
+        texts.admin_poster_text(poster, communities_text),
         keyboard=kb.poster_admin_kb(poster["id"], poster["status"]),
         attachment=poster["file_id"],
     )
@@ -920,9 +1063,10 @@ async def _poster_target_groups(poster_id: int) -> tuple[Any, list[Any]]:
         return None, []
 
     groups_data = await get_suitable_groups(poster)
+    target_groups = groups_data["selected_groups"] or groups_data["suitable_groups"]
     all_groups = []
     seen = set()
-    for group in groups_data["suitable_groups"] + groups_data["selected_groups"]:
+    for group in target_groups:
         if group["group_id"] not in seen:
             seen.add(group["group_id"])
             all_groups.append(group)
@@ -938,15 +1082,15 @@ async def _show_poster_schedule_groups(ctx: Ctx, poster_id: int) -> None:
         await ctx.answer("Нет подходящих площадок для этого объявления.", keyboard=kb.back("manage_ad_posts"))
         return
 
-    values = [group["group_id"] for group in all_groups]
-    text = ["Выберите площадку для отправки:"]
+    values = [int(group["group_id"]) for group in all_groups]
+    text = ["Пост будет запланирован в выбранные клиентом сообщества:"]
     for index, group in enumerate(all_groups, 1):
-        text.append(f"{index}) {await ctx.api.group_title(group['group_id'])}")
+        text.append(f"{index}) {await _community_link(ctx.api, int(group['group_id']))}")
     text.append("")
-    text.append("Можно нажать кнопку с номером или отправить номер сообщением.")
+    text.append("Введите время отправки по МСК в формате 18:00.")
     ctx.update_data(schedule_poster_id=poster_id, schedule_group_values=values)
-    ctx.set_state("poster_schedule_group")
-    await ctx.answer("\n".join(text), keyboard=kb.number_action_kb(len(values), "poster_schedule_group", "manage_ad_posts"))
+    ctx.set_state("poster_schedule_time")
+    await ctx.answer("\n".join(text), keyboard=kb.back("manage_ad_posts"))
 
 
 async def _select_poster_schedule_group(ctx: Ctx, raw_num: str) -> None:
@@ -1094,6 +1238,55 @@ def register_handlers(app: VKBotApp) -> None:
             return
         await _check_and_grant_subscription(ctx, main_group_id)
 
+    @app.command("check_pay")
+    async def check_pay(ctx: Ctx) -> None:
+        pay_info = ctx.data.get("current_pay_info") or {}
+        provider = str(pay_info.get("provider") or "")
+        label = str(pay_info.get("label") or "")
+        if not provider or not label:
+            await ctx.answer("Не нашел активный автоматический платеж. Можно начать покупку заново или отправить платеж на ручную проверку.")
+            return
+        try:
+            payment_check = await check_payment(provider, label)
+        except PaymentGatewayError:
+            logger.exception("Failed to check payment provider=%s label=%s", provider, label)
+            await ctx.answer(
+                "Не смог проверить платеж автоматически. Отправьте комментарий к платежу или скриншот, админ проверит вручную.",
+                keyboard=kb.keyboard([[kb.text_button("Ручная проверка", "manual_pay_flow", "primary")]]),
+            )
+            return
+        if not payment_check.is_succeeded:
+            pay_url = str(pay_info.get("pay_url") or "")
+            if payment_check.status == "canceled":
+                await ctx.answer(
+                    "Платеж отменен или истек. Начните покупку заново или отправьте оплату на ручную проверку.",
+                    keyboard=kb.keyboard([[kb.text_button("Ручная проверка", "manual_pay_flow", "primary")]]),
+                )
+                return
+            if payment_check.status == "waiting_for_capture":
+                await ctx.answer(
+                    "Платеж авторизован, но ЮKassa еще не завершила списание. Подождите минуту и нажмите проверку еще раз.",
+                    keyboard=kb.payment_confirmation_kb(pay_url, "menu_advertiser") if pay_url else None,
+                )
+                return
+            await ctx.answer(
+                "Платеж пока не найден. Если вы уже оплатили, подождите минуту и нажмите проверку еще раз.",
+                keyboard=kb.payment_confirmation_kb(pay_url, "menu_advertiser") if pay_url else None,
+            )
+            return
+
+        await activate_payment_state(ctx.api, _payment_state_from_data(ctx.data))
+        ctx.clear_state()
+
+    @app.command("manual_pay_flow")
+    async def manual_pay_flow(ctx: Ctx) -> None:
+        pay_info = ctx.data.get("current_pay_info") or {}
+        if not pay_info.get("sum"):
+            await ctx.answer("Не нашел активную покупку. Начните покупку заново.", keyboard=kb.advertiser_menu())
+            return
+        await ctx.answer(texts.manual_payment_instruction(int(pay_info["sum"])))
+        ctx.set_state("pay_details")
+
     @app.command("buy_group_access")
     async def buy_group_access(ctx: Ctx) -> None:
         main_group_id = int(ctx.payload.get("main_group_id") or 0)
@@ -1119,13 +1312,13 @@ def register_handlers(app: VKBotApp) -> None:
             access_rate_type=rate_type,
             access_rate=rate,
         )
-        await ctx.answer(
-            f"Выбран тариф: {_rate_label(rate_type, rate)}\n\n"
-            f"К оплате: {price} ₽.\n\n"
-            "YooMoney будет подключен последним этапом, сейчас покупка оформляется через ручное подтверждение.\n"
-            "Отправьте сюда комментарий к платежу или скриншот. Админ подтвердит заявку, после чего доступ активируется."
+        await ctx.answer(f"Выбран тариф: {_rate_label(rate_type, rate)}")
+        await _start_payment_flow(
+            ctx,
+            price,
+            f"Доступ к VK-площадке {main_group_id}",
+            back_cmd="menu_advertiser",
         )
-        ctx.set_state("pay_details")
 
     @app.command("menu_advertiser")
     async def advertiser_menu(ctx: Ctx) -> None:
@@ -1213,13 +1406,12 @@ def register_handlers(app: VKBotApp) -> None:
                 "Это число вида 2000001234, его можно получить командой /id в нужной беседе."
             )
             return
-        try:
-            group_name = await ctx.api.chat_title(chat_peer_id)
-            if not await ctx.api.is_chat_member(chat_peer_id, ctx.user_id):
-                await ctx.answer("Вы не состоите в этой VK-беседе, поэтому я не могу принять ее для подписочной рекламы.")
-                return
-        except Exception:
-            await ctx.answer("Не смог получить доступ к VK-беседе. Добавьте бота в беседу и повторите /id.")
+        group_name = await _resolve_chat_title(
+            ctx,
+            chat_peer_id,
+            access_error="Вы не состоите в этой VK-беседе, поэтому я не могу принять ее для подписочной рекламы.",
+        )
+        if not group_name:
             return
 
         async with VkGroups() as vk_groups:
@@ -1277,6 +1469,25 @@ def register_handlers(app: VKBotApp) -> None:
         await ctx.answer("Теперь напишите количество дней покупки, например 8.")
         ctx.set_state("buy_ad_period")
 
+    @app.command("confirm_poster_target_groups")
+    async def confirm_poster_target_groups(ctx: Ctx) -> None:
+        selected = _selected(ctx.data)
+        values = ctx.data.get("select_group_values") or []
+        if not selected:
+            await ctx.answer("Выберите хотя бы одно VK-сообщество для размещения.")
+            return
+        selected_group_ids = [int(values[int(num) - 1]) for num in sorted(selected, key=int)]
+        ctx.update_data(selected_group_ids=selected_group_ids)
+        titles = [await _community_link(ctx.api, group_id) for group_id in selected_group_ids]
+        text = [
+            "Выбранные сообщества:",
+            *[f"- {title}" for title in titles],
+            "",
+            "Теперь напишите количество дней размещения, например 8.",
+        ]
+        await ctx.answer("\n".join(text), keyboard=kb.back("buy_ad"))
+        ctx.set_state("buy_ad_period")
+
     @app.state_handler("buy_poster")
     async def buy_poster_state(ctx: Ctx) -> None:
         if "\n" not in ctx.text:
@@ -1306,7 +1517,7 @@ def register_handlers(app: VKBotApp) -> None:
             return
         ctx.update_data(region_codes=regions)
         await ctx.answer(texts.ADD_POSTER_SUCCESSFUL_TEXT.format(", ".join(get_regions().get(region, region) for region in regions)))
-        ctx.set_state("buy_ad_period")
+        await _show_poster_group_selector(ctx)
 
     @app.state_handler("buy_newsletter")
     async def buy_newsletter_state(ctx: Ctx) -> None:
@@ -1331,13 +1542,20 @@ def register_handlers(app: VKBotApp) -> None:
             return
         period = int(ctx.text)
         ad_type = ctx.data["ad_type"]
-        price = texts.calc_price(ad_type, period)
-        if not price:
+        base_price = texts.calc_price(ad_type, period)
+        if not base_price:
             await ctx.answer("На этот период тариф недоступен.")
             return
+        price = base_price
+        if ad_type == "poster":
+            selected_group_ids = list(map(int, ctx.data.get("selected_group_ids") or []))
+            if not selected_group_ids:
+                await ctx.answer("Сначала выберите хотя бы одно VK-сообщество для размещения.")
+                await _show_poster_group_selector(ctx)
+                return
+            price = base_price * len(selected_group_ids)
         ctx.update_data(sub_period=period, current_pay_info={"sum": price})
-        await ctx.answer(texts.payment_instruction(period, price))
-        ctx.set_state("pay_details")
+        await _start_payment_flow(ctx, price, f"Покупка рекламы VK на {period} д.", back_cmd="buy_ad")
 
     @app.state_handler("pay_details")
     async def pay_details_state(ctx: Ctx) -> None:
@@ -1430,13 +1648,12 @@ def register_handlers(app: VKBotApp) -> None:
     async def partner_group_id_state(ctx: Ctx) -> None:
         chat_peer_id = _parse_vk_chat_peer_id(ctx.text)
         if chat_peer_id:
-            try:
-                group_name = await ctx.api.chat_title(chat_peer_id)
-                if not await ctx.api.is_chat_member(chat_peer_id, ctx.user_id):
-                    await ctx.answer("Вы не состоите в этой VK-беседе, поэтому я не могу принять ее для настройки доступа.")
-                    return
-            except Exception:
-                await ctx.answer("Не смог получить доступ к VK-беседе. Добавьте бота в беседу и повторите /id.")
+            group_name = await _resolve_chat_title(
+                ctx,
+                chat_peer_id,
+                access_error="Вы не состоите в этой VK-беседе, поэтому я не могу принять ее для настройки доступа.",
+            )
+            if not group_name:
                 return
 
             group = await _create_access_chat_group(ctx, chat_peer_id, group_name)
@@ -1682,9 +1899,8 @@ def register_handlers(app: VKBotApp) -> None:
                 if not need_group_id:
                     await ctx.answer(f"Это не peer_id VK-беседы: {ref}")
                     return
-                try:
-                    need_group_name = await ctx.api.chat_title(need_group_id)
-                except Exception:
+                need_group_name = await _resolve_chat_title(ctx, need_group_id, require_user_member=False)
+                if not need_group_name:
                     await ctx.answer(f"Не смог получить доступ к VK-беседе: {ref}")
                     return
                 if need_group_id in seen:
@@ -1889,7 +2105,8 @@ def register_handlers(app: VKBotApp) -> None:
             await posters.change_status(poster_id, status)
             poster = await posters.get_by_id(poster_id)
         if action == "activate":
-            suitable = (await get_suitable_groups(poster))["suitable_groups"]
+            groups_data = await get_suitable_groups(poster)
+            suitable = groups_data["selected_groups"] or groups_data["suitable_groups"]
             async with PartnerGroups() as partner_groups:
                 for group in suitable:
                     await partner_groups.add_posters(group["group_id"], poster_id)
@@ -1957,11 +2174,17 @@ def register_handlers(app: VKBotApp) -> None:
             return
 
         poster_id = int(ctx.data["schedule_poster_id"])
-        group_id = int(ctx.data["schedule_group_id"])
+        group_ids = list(map(int, ctx.data.get("schedule_group_values") or []))
+        if not group_ids and ctx.data.get("schedule_group_id"):
+            group_ids = [int(ctx.data["schedule_group_id"])]
+        if not group_ids:
+            await ctx.answer("Не нашел выбранные сообщества для планирования.")
+            return
         async with Queue() as queue:
-            await queue.add(activate_time, group_id, poster_id)
+            for group_id in group_ids:
+                await queue.add(activate_time, group_id, poster_id)
         ctx.clear_state()
-        await ctx.answer(f"Пост запланирован на {activate_time.strftime('%H:%M')} МСК.")
+        await ctx.answer(f"Пост запланирован на {activate_time.strftime('%H:%M')} МСК. Сообществ: {len(group_ids)}.")
         await _show_poster(ctx, poster_id)
 
     @app.command("poster_select_groups")

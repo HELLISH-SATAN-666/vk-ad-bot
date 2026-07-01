@@ -311,7 +311,7 @@ def manage_partner_group_kb(group_id: int, status: int, is_admin: bool = False) 
 def manage_plains_kb() -> str:
     return keyboard(
         [
-            [text_button("Объявления", "manage_plain.poster")],
+            [text_button("Объявления за сообщество", "manage_plain.poster")],
             [text_button("Группы", "manage_plain.group")],
             [text_button("Рассылка", "manage_plain.newsletter")],
             [text_button("Назад", "manage_all_ads", "negative")],
@@ -370,6 +370,17 @@ def manual_payment_kb(pay_id: int) -> str:
         [
             [text_button("Подтвердить", "manual_pay.apply", "positive", pay_id=pay_id)],
             [text_button("Отклонить", "manual_pay.decline", "negative", pay_id=pay_id)],
+        ]
+    )
+
+
+def payment_confirmation_kb(pay_url: str, back_cmd: str = "menu_advertiser") -> str:
+    return keyboard(
+        [
+            [link_button("Оплатить", pay_url)],
+            [text_button("Проверить оплату", "check_pay", "positive")],
+            [text_button("Ручная проверка", "manual_pay_flow")],
+            [text_button("Назад", back_cmd, "negative")],
         ]
     )
 

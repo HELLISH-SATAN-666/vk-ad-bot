@@ -80,8 +80,12 @@ def edit_rate(current_rate_name: str, rate_period: str, rate_price: Optional[int
 
 
 async def get_suitable_groups(poster) -> dict[str, list]:
+    try:
+        poster_id = poster["id"]
+    except (KeyError, TypeError):
+        poster_id = None
     async with PartnerGroups() as partner_groups:
-        selected = await partner_groups.get_by_poster_id(poster["id"])
+        selected = await partner_groups.get_by_poster_id(poster_id) if poster_id else []
         suitable = await partner_groups.get_by_poster_info(poster)
     async with VkGroups() as vk_groups:
         selected = await _filter_wall_postable_groups(vk_groups, selected)
@@ -103,10 +107,10 @@ async def _filter_wall_postable_groups(vk_groups: VkGroups, groups: list) -> lis
     return result
 
 
-async def write_poster_content(advertiser_id: int, period: int, region_codes: list[int], poster_info: dict) -> None:
+async def write_poster_content(advertiser_id: int, period: int, region_codes: list[int], poster_info: dict) -> int:
     end_date = get_msk_now().date() + timedelta(days=period)
     async with Posters() as posters:
-        await posters.add(
+        return await posters.add(
             advertiser_id,
             int(poster_info["ad_topic_id"]),
             region_codes,
@@ -153,12 +157,8 @@ async def send_poster_to_group(api: VKApi, group_id: int, poster, text: Optional
     wall_text = text if not ref_link else f"{text}\n\n{button_name}: {ref_link}"
 
     if group_id > 2_000_000_000:
-        try:
-            await api.send_message(group_id, wall_text, attachment=attachment)
-            return True
-        except Exception:
-            logger.exception("Failed to send poster to VK chat %s", group_id)
-            return False
+        logger.warning("Poster %s skipped for VK chat %s; ads are posted only to community walls", poster["id"], group_id)
+        return False
 
     async with VkGroups() as vk_groups:
         meta = await vk_groups.get(abs(int(group_id)))
@@ -234,15 +234,24 @@ async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
 
     match ad_type:
         case "poster":
-            await write_poster_content(
+            poster_id = await write_poster_content(
                 from_user,
                 period,
                 list(map(int, payment_state["region_codes"])),
                 payment_state["poster_info"],
             )
+            selected_group_ids = list(map(int, payment_state.get("selected_group_ids") or []))
+            if selected_group_ids:
+                async with PartnerGroups() as partner_groups:
+                    await partner_groups.replace_poster_groups(poster_id, selected_group_ids)
             pay_type = PaymentTypes.POSTER
-            await api.send_message(from_user, "Оплата подтверждена. Объявление отправлено на модерацию.", keyboard=kb.advertiser_menu())
-            await send_log(api, "В бот добавлено новое рекламное объявление.")
+            message = "Объявление добавлено бесплатно." if price <= 0 else "Оплата подтверждена."
+            await api.send_message(
+                from_user,
+                f"{message} Объявление отправлено на модерацию.",
+                keyboard=kb.advertiser_menu(),
+            )
+            await send_log(api, f"В бот добавлено новое рекламное объявление. Выбрано сообществ: {len(selected_group_ids)}.")
 
         case "group":
             ad_group_id = int(payment_state["ad_group_id"])
@@ -260,7 +269,8 @@ async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
                     for partner_group_id in selected_group_ids:
                         await partner_groups.add_need_groups(partner_group_id, ad_group_id)
             pay_type = PaymentTypes.AD_GROUP
-            await api.send_message(from_user, "Оплата подтверждена. Беседа добавлена в подписочные условия выбранных площадок.", keyboard=kb.advertiser_menu())
+            message = "Добавлено бесплатно." if price <= 0 else "Оплата подтверждена."
+            await api.send_message(from_user, f"{message} Беседа добавлена в подписочные условия выбранных площадок.", keyboard=kb.advertiser_menu())
 
         case "newsletter":
             target = NewslettersTarget[payment_state["newsletter_target"].upper()]
@@ -276,7 +286,8 @@ async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
                     file_format=file_format,
                 )
             pay_type = PaymentTypes.NEWSLETTER
-            await api.send_message(from_user, "Оплата подтверждена. Рассылка отправлена на модерацию.", keyboard=kb.advertiser_menu())
+            message = "Рассылка добавлена бесплатно." if price <= 0 else "Оплата подтверждена."
+            await api.send_message(from_user, f"{message} Рассылка отправлена на модерацию.", keyboard=kb.advertiser_menu())
             await send_log(api, "В бот добавлена новая рассылка от рекламодателя.")
 
         case "sub_access":
@@ -298,8 +309,9 @@ async def activate_payment_state(api: VKApi, payment_state: dict) -> None:
                 else:
                     raise ValueError(f"Unknown sub access rate_type: {rate_type}")
             pay_type = PaymentTypes.SUB_ACCESS
-            await api.send_message(from_user, f"Оплата подтверждена. Доступ к площадке club{group_id}: {access_text}.")
-            await send_log(api, f"Оплачен доступ к VK-площадке club{group_id}: {access_text}.")
+            message = "Доступ выдан бесплатно." if price <= 0 else "Оплата подтверждена."
+            await api.send_message(from_user, f"{message} Доступ к площадке club{group_id}: {access_text}.")
+            await send_log(api, f"Выдан доступ к VK-площадке club{group_id}: {access_text}. Сумма: {price} ₽.")
 
         case _:
             raise ValueError(f"Unknown ad_type: {ad_type}")
@@ -394,6 +406,8 @@ async def add_day_posters_events() -> None:
 
     async with PartnerGroups() as partner_groups:
         groups = await partner_groups.get_all(status=PartnerTypes.PROMOTION)
+    async with VkGroups() as vk_groups:
+        groups = await _filter_wall_postable_groups(vk_groups, groups)
 
     async with Queue() as queue:
         for group in groups:

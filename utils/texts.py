@@ -86,7 +86,7 @@ BUY_GROUP_AD_TEXT = (
 BUY_NEWSLETTER_AD_TEXT = "Введите текст рассылки. Фото/видео можно прикрепить к этому же сообщению."
 
 ADD_GROUP_SUCCESSFUL_TEXT = "Беседа может быть добавлена. Теперь выберите площадки, где пользователь должен состоять в этой беседе перед сообщением."
-ADD_POSTER_SUCCESSFUL_TEXT = "Объявление записано. Регионы: {}.\n\nТеперь напишите количество дней покупки, например 8."
+ADD_POSTER_SUCCESSFUL_TEXT = "Объявление записано. Регионы: {}."
 ADD_NEWSLETTER_SUCCESSFUL_TEXT = "Рассылка записана.\n\nТеперь напишите количество дней покупки, например 8."
 
 REQUEST_PAY_DETAILS_TEXT = (
@@ -102,7 +102,7 @@ def categories_text() -> str:
 def ad_rates_text() -> str:
     rates = get_rates_safe()
     names = {
-        "poster": "Тарифы на объявления",
+        "poster": "Тарифы на объявления за 1 сообщество",
         "group": "Тарифы на доступ по подписке",
         "newsletter": "Тарифы на рассылку",
     }
@@ -135,8 +135,22 @@ def calc_price(ad_type: str, period: int) -> int | None:
 def payment_instruction(period: int, price: int) -> str:
     return (
         f"За {period} д. необходимо заплатить {price} ₽.\n\n"
-        "YooMoney будет подключен последним этапом, сейчас покупка оформляется через ручное подтверждение.\n"
         "Отправьте сюда комментарий к платежу или скриншот. Админ подтвердит заявку, после чего реклама активируется."
+    )
+
+
+def automated_payment_instruction(price: int, provider: str) -> str:
+    provider_name = {"yoomoney": "YooMoney", "yookassa": "YooKassa"}.get(provider, provider)
+    return (
+        f"К оплате: {price} ₽ через {provider_name}.\n\n"
+        "После оплаты нажмите «Проверить оплату». Если автоматическая проверка не пройдет, можно отправить платеж на ручную проверку."
+    )
+
+
+def manual_payment_instruction(price: int) -> str:
+    return (
+        f"К оплате: {price} ₽.\n\n"
+        "Отправьте сюда комментарий к платежу или скриншот. Админ подтвердит заявку, после чего покупка активируется."
     )
 
 
@@ -176,12 +190,13 @@ def format_group_title(group: Record | dict | None) -> str:
     return str(group.get("group_id") or group.get("id"))
 
 
-def admin_poster_text(poster: Record | dict) -> str:
+def admin_poster_text(poster: Record | dict, communities_text: str | None = None) -> str:
     statuses = {-1: "Удалено", 0: "На модерации", 1: "Активно", 2: "Заморожено"}
     regions = get_regions()
     categories = get_ad_categories()
     selected_regions = ", ".join(regions.get(str(code), str(code)) for code in poster["region_codes"])
     file_text = "Есть" if poster["file_id"] else "Отсутствует"
+    communities_block = f"Выбранные сообщества:\n{communities_text}\n" if communities_text else ""
     return (
         f"Объявление #{poster['id']}\n\n"
         f"Статус: {statuses.get(poster['status'], poster['status'])}\n"
@@ -189,7 +204,8 @@ def admin_poster_text(poster: Record | dict) -> str:
         f"Регионы: {selected_regions}\n"
         f"Тема: {categories.get(str(poster['topic_id']), poster['topic_id'])}\n"
         f"Файл: {file_text}\n"
-        f"Текст кнопки: {poster['referral_button_name'] or 'Купить рекламу'}\n\n"
+        f"Текст кнопки: {poster['referral_button_name'] or 'Купить рекламу'}\n"
+        f"{communities_block}\n"
         f"{poster['text']}"
     )
 

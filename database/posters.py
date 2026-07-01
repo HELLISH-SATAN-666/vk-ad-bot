@@ -18,19 +18,19 @@ class Posters(Database):
     def __init__(self):
         super().__init__()
 
-    async def add(self, creator_id: int, topic_id: int, region_codes: list[int], text: str, file_id: str, file_format: Literal["video", "photo", "none"], end_date):
+    async def add(self, creator_id: int, topic_id: int, region_codes: list[int], text: str, file_id: str, file_format: Literal["video", "photo", "none"], end_date) -> int:
         await self.connect()
 
         db_file_id = None
         if file_id:
             db_file_id = file_id if file_id.startswith(("photo", "video", "doc")) else file_format + file_id
 
-        await self.execute(
-            "INSERT INTO posters(file_id, topic_id, region_codes, text, creator_id, end_date) VALUES ($1, $2, $3, $4, $5, $6);",
+        poster_id = await self.fetchval(
+            "INSERT INTO posters(file_id, topic_id, region_codes, text, creator_id, end_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id;",
             db_file_id, topic_id, region_codes, text, creator_id, end_date
         )
 
-        return self
+        return int(poster_id)
 
     async def change_button_name(self, poster_id: int, new_button_name: str):
         await self.execute(
